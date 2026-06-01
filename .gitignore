@@ -1,0 +1,20 @@
+__pycache__/
+*.py[cod]
+.venv/
+.env
+data/
+*.sqlite
+*.db
+
+# Secrets / credentials
+*.pem
+*.key
+*.txt.bak
+weather-algo.txt
+
+# Local editor/agent artifacts
+.claude/
+.vscode/
+_diag.py
+_diag_out.txt
+audit/

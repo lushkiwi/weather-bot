@@ -1,0 +1,93 @@
+from __future__ import annotations
+
+import argparse
+import time
+from datetime import datetime
+
+from dotenv import load_dotenv
+
+from .config import Settings
+from .demo_execution import DemoExecutor
+from .fees import FeeModel
+from .kalshi_client import KalshiClient
+from .paper import PaperTrader
+from .pnl import reconcile_paper_settlements
+from .safety import SafetyGuard
+from .shadow import ProductionShadowTracker
+from .storage import Store
+
+
+def main(argv: list[str] | None = None) -> int:
+    load_dotenv(".env")
+    parser = argparse.ArgumentParser(description="Continuous Kalshi weather bot runner")
+    parser.add_argument("--limit", type=int, default=None, help="Max markets to fetch per configured series")
+    parser.add_argument("--interval-seconds", type=int, default=900)
+    parser.add_argument("--db", default="data/kalshi_weather.sqlite")
+    parser.add_argument("--quantity", type=int, default=1)
+    parser.add_argument("--fee-rate", type=float, default=0.07)
+    parser.add_argument("--execute-demo", action="store_true", help="Submit qualifying FOK orders to Kalshi demo")
+    parser.add_argument("--production-shadow", action="store_true", help="Also run production-market shadow tracking without submitting orders")
+    parser.add_argument("--once", action="store_true", help="Run one iteration and exit")
+    args = parser.parse_args(argv)
+
+    settings = Settings()
+    store = Store(args.db)
+    safety = SafetyGuard()
+    client = KalshiClient(settings)
+    demo_executor = DemoExecutor(client, store) if args.execute_demo else None
+
+    store.insert_runner_event("info", f"runner_start execute_demo={args.execute_demo} interval={args.interval_seconds}")
+    print(f"Runner started at {datetime.now().isoformat(timespec='seconds')}")
+    print(f"DB: {args.db}")
+    print(f"Interval seconds: {args.interval_seconds}")
+    print(f"Demo execution: {args.execute_demo}")
+    print(f"Production shadow: {args.production_shadow}")
+
+    while True:
+        started = datetime.now().isoformat(timespec="seconds")
+        try:
+            trader = PaperTrader(
+                settings,
+                store,
+                quantity=args.quantity,
+                fee_model=FeeModel(rate=args.fee_rate),
+                demo_executor=demo_executor,
+                safety_guard=safety,
+            )
+            result = trader.run_once(args.limit or settings.kalshi_market_limit)
+            pnl = reconcile_paper_settlements(settings, store)
+            shadow_msg = ""
+            if args.production_shadow:
+                shadow = ProductionShadowTracker(settings, store, quantity=args.quantity, fee_model=FeeModel(rate=args.fee_rate))
+                shadow_result = shadow.run_once(args.limit or settings.kalshi_market_limit)
+                shadow_pnl = shadow.reconcile_settlements()
+                shadow_msg = (
+                    f" shadow_scan_id={shadow_result.scan_id} shadow_markets={shadow_result.markets_seen} "
+                    f"shadow_snapshots={shadow_result.snapshots_recorded} shadow_fills={shadow_result.shadow_orders_filled} "
+                    f"shadow_no_liq={shadow_result.skipped_no_liquidity} shadow_no_edge={shadow_result.skipped_no_edge} "
+                    f"shadow_market_errors={shadow_result.market_errors} "
+                    f"shadow_pnl_checked={shadow_pnl.markets_checked} shadow_pnl_settled={shadow_pnl.orders_settled}"
+                )
+            msg = (
+                f"scan_id={result.scan_id} markets={result.markets_seen} signals={result.signals_recorded} "
+                f"local_fills={result.orders_filled} demo_submitted={result.demo_orders_submitted} "
+                f"demo_errors={result.demo_order_errors} no_liq={result.skipped_no_liquidity} no_edge={result.skipped_no_edge} "
+                f"market_errors={result.market_errors} "
+                f"pnl_checked={pnl.markets_checked} pnl_settled={pnl.orders_settled}{shadow_msg}"
+            )
+            store.insert_runner_event("info", msg)
+            print(f"[{started}] {msg}", flush=True)
+        except Exception as exc:  # noqa: BLE001
+            msg = f"runner_error {type(exc).__name__}: {exc}"
+            store.insert_runner_event("error", msg)
+            print(f"[{started}] {msg}", flush=True)
+
+        if args.once:
+            break
+        time.sleep(max(args.interval_seconds, 30))
+
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
