@@ -1,0 +1,14 @@
+.git
+.venv
+data
+*.sqlite
+*.db
+.env
+.env.*
+*.pem
+*.key
+*.txt.bak
+__pycache__
+*.pyc
+.claude
+docs/superpowers
