@@ -54,23 +54,48 @@ Never commit:
 
 Use environment variables in Vercel/Railway/Fly/Render/GitHub Actions.
 
-## Next implementation steps
+## Deployed architecture (live)
 
-1. Add a Postgres-backed `Store` implementation, while keeping SQLite for local dev.
-2. Add config such as `DATABASE_URL` or `SUPABASE_DB_URL`.
-3. Make the runner write to Supabase Postgres in hosted mode.
-4. Build or adapt the dashboard for Vercel:
-   - Option A: Next.js dashboard reading Supabase from server-side routes.
-   - Option B: keep the current Python dashboard and host it on Railway/Fly instead of Vercel.
-5. Deploy the runner separately:
-   - Railway/Fly/Render as a worker process, or
-   - GitHub Actions cron running `kalshi-weather-runner --once --production-shadow` every 15 minutes.
+The cloud migration is implemented and running:
 
-## Recommended path
+```text
+GitHub (lushkiwi/weather-bot, branch main)
+  └─ Railway project "weather-bot"  (workspace: lushkiwi's Projects)
+       ├─ service "runner"     — cron `*/10 * * * *`, restart NEVER
+       │     start: python -m kalshi_weather_bot.runner --once --production-shadow --shadow-only --limit 50
+       └─ service "dashboard"  — always-on web, public domain
+             start: python -m kalshi_weather_bot.web_ui --host 0.0.0.0   (binds $PORT)
+  └─ Supabase Postgres (project weather-bot, ref xtttchcsmlzjsxcnrttb): all ledger tables
+```
 
-For the cleanest setup:
+- **Database**: `storage.py` `Store` is dual-backend. Set `DATABASE_URL` (Supabase session-pooler
+  URI) → Postgres; leave blank → local SQLite for dev. The committed migration
+  (`supabase/migrations/20260601052455_initial_weather_bot_schema.sql`) is already applied to the
+  hosted project.
+- **Build**: `Dockerfile` (`pip install .` on `python:3.11-slim`) — chosen over Nixpacks because
+  Nixpacks left the package uninstalled, so the console scripts were missing.
+- **Runner mode**: `--shadow-only` skips the demo-API paper path entirely and runs only the
+  read-only production shadow scan + settlement, so the cron needs only production read creds
+  (`KALSHI_SHADOW_API_KEY_ID` + `KALSHI_SHADOW_PRIVATE_KEY`). **No live trading; no demo orders.**
+- **Dashboard**: same image, hosted as a second Railway service with a generated `*.up.railway.app`
+  domain. It reads Supabase and renders the production-shadow stats (plus paper/demo panes).
 
-1. Supabase Postgres for data.
-2. Railway or Fly.io for the Python runner.
-3. Vercel + Next.js for the dashboard.
-4. Keep live trading disabled; production shadow remains read-only.
+### Required Railway variables (both services)
+
+`DATABASE_URL`, `KALSHI_SHADOW_API_KEY_ID`, `KALSHI_SHADOW_PRIVATE_KEY` (inline PEM),
+`KALSHI_SHADOW_BASE_URL`, the series/limit/edge config, and the safety/gate vars
+(`BEST_STRIKE_PER_EVENT`, `FORECAST_UNCERTAINTY_GATE_RATIO`,
+`SHADOW_FORECAST_UNCERTAINTY_GATE_RATIO`, `SHADOW_GATE_EXPERIMENT_UNTIL`, `MIN_TRADE_PROBABILITY`,
+`MAX_*`, `DISALLOW_*`). The dashboard additionally sets `PORT=8080`. Never commit these.
+
+### Operating notes
+
+- Pushing to `main` redeploys (Railway is connected to the GitHub repo).
+- **Shadow gate experiment** `SHADOW_GATE_EXPERIMENT_UNTIL` controls how long the relaxed shadow
+  gate (`SHADOW_FORECAST_UNCERTAINTY_GATE_RATIO=6.0`) records temperature markets. After that date
+  the conservative gate blocks ~all temperature ladders and shadow records little. Bump the Railway
+  var to keep collecting. Per `CLAUDE.md`, fills in this window are calibration data, not edge.
+- Local dev still works with no `DATABASE_URL` (SQLite) and `kalshi-weather-*` commands.
+
+A Vercel + Next.js dashboard remains a possible future upgrade, but the Python dashboard on Railway
+covers the need today without a rewrite.
