@@ -4,6 +4,7 @@ import argparse
 import math
 from dataclasses import dataclass, field
 
+from .config import Settings
 from .storage import Store
 
 # Joins settled orders to the probability that was predicted for them, so we can ask the
@@ -130,7 +131,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--include-lookahead", action="store_true", help="Include same-day/elapsed markets (leakage-inflated)")
     args = parser.parse_args(argv)
 
-    store = Store(args.db)
+    store = Store(Settings().database_url or args.db)
     sources = ["paper", "shadow"] if args.source == "both" else [args.source]
     for source in sources:
         report = compute_calibration(store, source=source, include_lookahead=args.include_lookahead)

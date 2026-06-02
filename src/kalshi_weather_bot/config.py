@@ -19,6 +19,9 @@ class Settings(BaseSettings):
         alias="KALSHI_BASE_URL",
     )
     kalshi_market_limit: int = Field(default=50, alias="KALSHI_MARKET_LIMIT")
+    # Hosted Postgres/Supabase connection string. When set, the SQLite-backed Store switches to
+    # Postgres (see storage.py). Leave blank to use the local SQLite file for development.
+    database_url: str | None = Field(default=None, alias="DATABASE_URL")
     kalshi_shadow_base_url: str = Field(
         default="https://external-api.kalshi.com/trade-api/v2",
         alias="KALSHI_SHADOW_BASE_URL",

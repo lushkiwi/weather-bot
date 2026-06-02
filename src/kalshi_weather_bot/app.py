@@ -93,17 +93,19 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     settings = Settings()
+    # Hosted Postgres (DATABASE_URL) takes precedence over the local SQLite path.
+    db_target = settings.database_url or args.db
     client = KalshiClient(settings)
     if args.execute_demo and not client.is_demo:
         raise RuntimeError("Refusing automatic execution because KALSHI_BASE_URL is not a demo URL.")
 
-    Store(args.db).insert_runner_event("info", f"app_start execute_demo={args.execute_demo} dashboard=http://{args.host}:{args.port}")
+    Store(db_target).insert_runner_event("info", f"app_start execute_demo={args.execute_demo} dashboard=http://{args.host}:{args.port}")
     stop_event = threading.Event()
     thread = threading.Thread(
         target=runner_loop,
         kwargs={
             "settings": settings,
-            "db_path": args.db,
+            "db_path": db_target,
             "limit": args.limit or settings.kalshi_market_limit,
             "interval_seconds": args.interval_seconds,
             "quantity": args.quantity,
@@ -117,13 +119,13 @@ def main(argv: list[str] | None = None) -> int:
     )
     thread.start()
 
-    DashboardHandler.db_path = args.db
+    DashboardHandler.db_path = db_target
     server = ThreadingHTTPServer((args.host, args.port), DashboardHandler)
     _safe_print(f"Dashboard running at http://{args.host}:{args.port}")
     _safe_print(f"Automatic scanner interval: {args.interval_seconds}s")
     _safe_print(f"Demo execution: {args.execute_demo}")
     _safe_print(f"Production shadow: {args.production_shadow}")
-    _safe_print(f"Using database: {args.db}")
+    _safe_print(f"Using database: {'postgres' if settings.database_url else args.db}")
     try:
         server.serve_forever()
     except KeyboardInterrupt:

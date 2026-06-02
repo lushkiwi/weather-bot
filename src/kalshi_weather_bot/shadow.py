@@ -341,80 +341,37 @@ class ProductionShadowTracker:
 
 
 class _ShadowSafetyView:
+    """Adapts the shadow_orders ledger to the read interface SafetyGuard expects (the same
+    method names the Store exposes for paper orders), delegating to the Store's shadow_*
+    helpers so all SQL/backend dialect lives in storage.py."""
+
     def __init__(self, store: Store):
         self.store = store
 
     def count_orders_today(self) -> int:
-        row = self.store.conn.execute("SELECT COUNT(*) FROM shadow_orders WHERE status IN ('SHADOW_FILLED', 'SHADOW_SETTLED') AND date(created_at) = date('now', 'localtime')").fetchone()
-        return int(row[0])
+        return self.store.count_shadow_orders_today()
 
     def count_orders_since(self, ticker: str, side: str, minutes: int) -> int:
-        row = self.store.conn.execute(
-            """
-            SELECT COUNT(*)
-            FROM shadow_orders
-            WHERE status IN ('SHADOW_FILLED', 'SHADOW_SETTLED')
-              AND ticker = ?
-              AND side = ?
-              AND created_at >= datetime('now', ?)
-            """,
-            (ticker, side, f"-{minutes} minutes"),
-        ).fetchone()
-        return int(row[0])
+        return self.store.count_shadow_orders_since(ticker, side, minutes)
 
     def has_opposite_position(self, ticker: str, side: str) -> bool:
-        opposite = "BUY_NO" if side == "BUY_YES" else "BUY_YES"
-        row = self.store.conn.execute(
-            "SELECT COALESCE(SUM(quantity), 0) FROM shadow_orders WHERE status = 'SHADOW_FILLED' AND ticker = ? AND side = ? AND realized_pnl_cents IS NULL",
-            (ticker, opposite),
-        ).fetchone()
-        return int(row[0] or 0) > 0
+        return self.store.shadow_has_opposite_position(ticker, side)
 
     def position_quantity(self, ticker: str, side: str | None = None) -> int:
-        if side is None:
-            row = self.store.conn.execute("SELECT COALESCE(SUM(quantity), 0) FROM shadow_orders WHERE status = 'SHADOW_FILLED' AND ticker = ? AND realized_pnl_cents IS NULL", (ticker,)).fetchone()
-        else:
-            row = self.store.conn.execute("SELECT COALESCE(SUM(quantity), 0) FROM shadow_orders WHERE status = 'SHADOW_FILLED' AND ticker = ? AND side = ? AND realized_pnl_cents IS NULL", (ticker, side)).fetchone()
-        return int(row[0]) if row else 0
+        return self.store.shadow_position_quantity(ticker, side)
 
     def total_open_exposure_cents(self) -> float:
-        row = self.store.conn.execute(
-            """
-            SELECT COALESCE(SUM(quantity * avg_fill_price_cents), 0)
-            FROM shadow_orders
-            WHERE status = 'SHADOW_FILLED' AND realized_pnl_cents IS NULL
-            """
-        ).fetchone()
-        return float(row[0] or 0.0)
+        return self.store.shadow_total_open_exposure_cents()
 
     def event_order_quantity(self, event_ticker: str) -> int:
         """Contracts already placed on this correlated event, open or settled."""
-        row = self.store.conn.execute(
-            "SELECT COALESCE(SUM(quantity), 0) FROM shadow_orders WHERE status IN ('SHADOW_FILLED', 'SHADOW_SETTLED') AND ticker LIKE ?",
-            (f"{event_ticker}-%",),
-        ).fetchone()
-        return int(row[0]) if row else 0
+        return self.store.shadow_event_order_quantity(event_ticker)
 
     def event_position_quantity(self, event_ticker: str, side: str | None = None) -> int:
-        like = f"{event_ticker}-%"
-        if side is None:
-            row = self.store.conn.execute(
-                "SELECT COALESCE(SUM(quantity), 0) FROM shadow_orders WHERE status = 'SHADOW_FILLED' AND ticker LIKE ? AND realized_pnl_cents IS NULL",
-                (like,),
-            ).fetchone()
-        else:
-            row = self.store.conn.execute(
-                "SELECT COALESCE(SUM(quantity), 0) FROM shadow_orders WHERE status = 'SHADOW_FILLED' AND ticker LIKE ? AND side = ? AND realized_pnl_cents IS NULL",
-                (like, side),
-            ).fetchone()
-        return int(row[0]) if row else 0
+        return self.store.shadow_event_position_quantity(event_ticker, side)
 
     def event_open_exposure_cents(self, event_ticker: str) -> float:
-        row = self.store.conn.execute(
-            "SELECT COALESCE(SUM(quantity * avg_fill_price_cents), 0) FROM shadow_orders WHERE status = 'SHADOW_FILLED' AND ticker LIKE ? AND realized_pnl_cents IS NULL",
-            (f"{event_ticker}-%",),
-        ).fetchone()
-        return float(row[0] or 0.0)
+        return self.store.shadow_event_open_exposure_cents(event_ticker)
 
 
 def _market_is_tradeable(market: dict) -> bool:

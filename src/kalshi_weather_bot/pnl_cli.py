@@ -16,7 +16,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--limit", type=int, default=None, help="Max unsettled markets to check")
     args = parser.parse_args(argv)
 
-    result = reconcile_paper_settlements(Settings(), Store(args.db), limit=args.limit)
+    settings = Settings()
+    result = reconcile_paper_settlements(settings, Store(settings.database_url or args.db), limit=args.limit)
     print(f"markets_checked: {result.markets_checked}")
     print(f"orders_settled: {result.orders_settled}")
     print(f"errors: {result.errors}")

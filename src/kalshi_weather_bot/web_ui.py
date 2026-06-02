@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
-import sqlite3
+import os
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
@@ -14,7 +14,7 @@ from .config import Settings
 from .fees import FeeModel
 from .paper import PaperTrader
 from .shadow import ProductionShadowTracker
-from .storage import Store
+from .storage import Store, _is_postgres_target
 
 DEFAULT_DB = "data/kalshi_weather.sqlite"
 
@@ -414,26 +414,33 @@ class DashboardHandler(BaseHTTPRequestHandler):
         self.wfile.write(payload)
 
 
-def rows(conn: sqlite3.Connection, sql: str, params: tuple = ()) -> list[dict]:
+def rows(conn: object, sql: str, params: tuple = ()) -> list[dict]:
     return [dict(row) for row in conn.execute(sql, params).fetchall()]
 
 
-def one(conn: sqlite3.Connection, sql: str, params: tuple = ()) -> dict | None:
+def one(conn: object, sql: str, params: tuple = ()) -> dict | None:
     row = conn.execute(sql, params).fetchone()
     return dict(row) if row else None
 
 
-def _count(conn: sqlite3.Connection, table: str) -> int:
+def _count(conn: object, table: str) -> int:
     return int(conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
 
 
 def load_summary(db_path: str) -> dict:
-    path = Path(db_path)
-    if not path.exists():
+    # Local SQLite that has never been written to: report an empty dashboard rather than
+    # creating a stray file. (Postgres always connects.)
+    if not _is_postgres_target(db_path) and not Path(db_path).exists():
         return _empty_summary()
-    Store(str(path)).conn.close()
-    conn = sqlite3.connect(path)
-    conn.row_factory = sqlite3.Row
+    store = Store(db_path)
+    conn = store.conn
+    # Hour-bucket label expression differs by backend (SQLite strftime vs Postgres to_char).
+    if store.is_postgres:
+        def bucket(col: str) -> str:
+            return f"to_char({col}, 'MM-DD HH24\":00\"')"
+    else:
+        def bucket(col: str) -> str:
+            return f"strftime('%m-%d %H:00', {col})"
     try:
         pnl = one(conn, """
             SELECT
@@ -458,7 +465,7 @@ def load_summary(db_path: str) -> dict:
                 "scans": _count(conn, "scans"),
                 "signals": _count(conn, "signals"),
                 "orders": _count(conn, "paper_orders"),
-                "positions": conn.execute("SELECT COUNT(*) FROM (SELECT 1 FROM paper_orders WHERE status = 'FILLED' AND realized_pnl_cents IS NULL GROUP BY ticker, side)").fetchone()[0],
+                "positions": conn.execute("SELECT COUNT(*) FROM (SELECT 1 FROM paper_orders WHERE status = 'FILLED' AND realized_pnl_cents IS NULL GROUP BY ticker, side) AS sub").fetchone()[0],
                 "demo_orders": _count(conn, "demo_orders"),
                 "shadow_snapshots": _count(conn, "shadow_snapshots"),
                 "shadow_orders": _count(conn, "shadow_orders"),
@@ -482,8 +489,8 @@ def load_summary(db_path: str) -> dict:
                 ORDER BY s.id DESC
                 LIMIT 40
             """),
-            "scan_series": rows(conn, """
-                SELECT strftime('%m-%d %H:00', s.started_at) AS bucket,
+            "scan_series": rows(conn, f"""
+                SELECT {bucket('s.started_at')} AS bucket,
                        COUNT(DISTINCT sig.id) AS signals,
                        COUNT(DISTINCT po.id) AS paper_orders,
                        COUNT(DISTINCT sh.id) AS shadow_snapshots,
@@ -516,7 +523,7 @@ def load_summary(db_path: str) -> dict:
             "runner_events": rows(conn, "SELECT * FROM runner_events ORDER BY id DESC LIMIT 80"),
             "pnl_by_side": rows(conn, "SELECT side, COUNT(*) AS orders, SUM(CASE WHEN realized_pnl_cents > 0 THEN 1 ELSE 0 END) AS wins, COALESCE(SUM(realized_pnl_cents), 0) AS realized_pnl_cents FROM paper_orders WHERE realized_pnl_cents IS NOT NULL GROUP BY side ORDER BY side"),
             "shadow_pnl_by_side": rows(conn, "SELECT side, COUNT(*) AS orders, SUM(CASE WHEN realized_pnl_cents > 0 THEN 1 ELSE 0 END) AS wins, COALESCE(SUM(realized_pnl_cents), 0) AS realized_pnl_cents FROM shadow_orders WHERE realized_pnl_cents IS NOT NULL GROUP BY side ORDER BY side"),
-            "shadow_pnl_series": rows(conn, "SELECT strftime('%m-%d %H:00', COALESCE(settled_at, created_at)) AS bucket, COALESCE(SUM(realized_pnl_cents), 0) AS realized_pnl_cents FROM shadow_orders WHERE realized_pnl_cents IS NOT NULL GROUP BY bucket ORDER BY MIN(COALESCE(settled_at, created_at)) LIMIT 48"),
+            "shadow_pnl_series": rows(conn, f"SELECT {bucket('COALESCE(settled_at, created_at)')} AS bucket, COALESCE(SUM(realized_pnl_cents), 0) AS realized_pnl_cents FROM shadow_orders WHERE realized_pnl_cents IS NOT NULL GROUP BY bucket ORDER BY MIN(COALESCE(settled_at, created_at)) LIMIT 48"),
             "shadow_comparison": rows(conn, """
                 WITH latest_signal AS (
                   SELECT s1.* FROM signals s1
@@ -537,18 +544,17 @@ def load_summary(db_path: str) -> dict:
                 ORDER BY sh.id DESC
                 LIMIT 80
             """),
-            "calibration": _calibration_summary(conn),
+            "calibration": _calibration_summary(store),
         }
     finally:
         conn.close()
 
 
-def _calibration_summary(conn: sqlite3.Connection) -> dict:
+def _calibration_summary(store: Store) -> dict:
     """Headline calibration metrics for the dashboard (leakage-flagged rows excluded)."""
-    shim = type("_StoreShim", (), {"conn": conn})()
     out = {}
     for source in ("paper", "shadow"):
-        r = compute_calibration(shim, source=source, include_lookahead=False)
+        r = compute_calibration(store, source=source, include_lookahead=False)
         out[source] = {
             "n": r.n,
             "n_events": r.n_events,
@@ -582,16 +588,21 @@ def _empty_summary() -> dict:
 
 
 def main(argv: list[str] | None = None) -> int:
+    load_dotenv(".env")
     parser = argparse.ArgumentParser(description="Kalshi weather bot web dashboard")
-    parser.add_argument("--host", default="127.0.0.1")
-    parser.add_argument("--port", type=int, default=8787)
+    # Default to 0.0.0.0 / $PORT so the container is reachable on Railway; override locally if desired.
+    parser.add_argument("--host", default=os.environ.get("HOST", "127.0.0.1"))
+    parser.add_argument("--port", type=int, default=int(os.environ.get("PORT", "8787")))
     parser.add_argument("--db", default=DEFAULT_DB)
     args = parser.parse_args(argv)
 
-    DashboardHandler.db_path = args.db
+    # Hosted Postgres (DATABASE_URL) takes precedence over the local SQLite path.
+    db_target = Settings().database_url or args.db
+    DashboardHandler.db_path = db_target
     server = ThreadingHTTPServer((args.host, args.port), DashboardHandler)
+    shown_db = "postgres" if _is_postgres_target(db_target) else db_target
     print(f"Dashboard running at http://{args.host}:{args.port}")
-    print(f"Using database: {args.db}")
+    print(f"Using database: {shown_db}")
     server.serve_forever()
     return 0
 

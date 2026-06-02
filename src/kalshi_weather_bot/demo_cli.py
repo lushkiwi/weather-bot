@@ -24,7 +24,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     settings = Settings()
-    store = Store(args.db)
+    store = Store(settings.database_url or args.db)
     client = KalshiClient(settings)
     executor = DemoExecutor(client, store)
 

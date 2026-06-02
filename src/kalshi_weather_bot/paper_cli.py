@@ -20,7 +20,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     settings = Settings()
-    store = Store(args.db)
+    store = Store(settings.database_url or args.db)
     trader = PaperTrader(settings, store, quantity=args.quantity, fee_model=FeeModel(rate=args.fee_rate))
     result = trader.run_once(args.limit or settings.kalshi_market_limit)
     summary = store.summary()
@@ -33,7 +33,7 @@ def main(argv: list[str] | None = None) -> int:
     print(f"demo_order_errors: {result.demo_order_errors}")
     print(f"skipped_no_liquidity: {result.skipped_no_liquidity}")
     print(f"skipped_no_edge: {result.skipped_no_edge}")
-    print(f"db: {args.db}")
+    print(f"db: {'postgres' if settings.database_url else args.db}")
     print(f"total_signals: {summary['signals']}")
     print(f"total_orders: {summary['orders']}")
     print(f"open_positions: {summary['positions']}")

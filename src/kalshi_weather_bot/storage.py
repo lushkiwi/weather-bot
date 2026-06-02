@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sqlite3
 from pathlib import Path
 from typing import Any
@@ -159,15 +160,128 @@ CREATE TABLE IF NOT EXISTS runner_events (
 """
 
 
+def _is_postgres_target(target: str) -> bool:
+    """True when the store target is a Postgres connection URL rather than a file path."""
+    return target.startswith("postgres://") or target.startswith("postgresql://")
+
+
+class _PgRow:
+    """Row that mimics ``sqlite3.Row``: supports both positional (``row[0]``) and name
+    (``row["col"]``) access, and the mapping protocol so ``dict(row)`` works."""
+
+    __slots__ = ("_cols", "_vals")
+
+    def __init__(self, cols: list[str], vals: tuple):
+        self._cols = cols
+        self._vals = vals
+
+    def __getitem__(self, key):
+        if isinstance(key, (int, slice)):
+            return self._vals[key]
+        try:
+            return self._vals[self._cols.index(key)]
+        except ValueError as exc:
+            raise KeyError(key) from exc
+
+    def keys(self) -> list[str]:
+        return list(self._cols)
+
+    def get(self, key, default=None):
+        try:
+            return self[key]
+        except (KeyError, IndexError):
+            return default
+
+    def __iter__(self):
+        return iter(self._vals)
+
+    def __len__(self) -> int:
+        return len(self._vals)
+
+
+def _pg_row_factory(cursor):
+    cols = [c.name for c in cursor.description] if cursor.description else []
+
+    def make_row(values):
+        return _PgRow(cols, tuple(values))
+
+    return make_row
+
+
+class _PgConnection:
+    """Thin adapter exposing the slice of ``sqlite3.Connection`` the Store uses, backed by
+    psycopg. Translates ``?`` placeholders to ``%s`` so the existing SQL works unchanged, and
+    runs in autocommit mode so reads never hold an idle transaction (important for the
+    per-request dashboard) and writes persist immediately (matching the SQLite commit pattern).
+    """
+
+    def __init__(self, dsn: str):
+        import psycopg  # imported lazily so SQLite-only/local use needs no psycopg
+
+        # prepare_threshold=None disables server-side prepared statements, which are
+        # incompatible with Supabase's transaction-mode (pgbouncer) pooler on port 6543.
+        self._conn = psycopg.connect(
+            dsn, autocommit=True, prepare_threshold=None, row_factory=_pg_row_factory
+        )
+
+    def execute(self, sql: str, params: Any = ()):  # noqa: ANN401
+        cur = self._conn.cursor()
+        if params:
+            # Escape any literal % first, then map qmark placeholders to psycopg's %s.
+            translated = sql.replace("%", "%%").replace("?", "%s")
+            cur.execute(translated, tuple(params))
+        else:
+            cur.execute(sql)
+        return cur
+
+    def commit(self) -> None:
+        # No-op: the connection runs in autocommit mode.
+        return None
+
+    def close(self) -> None:
+        self._conn.close()
+
+
 class Store:
     def __init__(self, path: str = "data/kalshi_weather.sqlite"):
-        self.path = Path(path)
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.conn = sqlite3.connect(self.path)
-        self.conn.row_factory = sqlite3.Row
-        self.conn.executescript(SCHEMA)
-        self._migrate()
+        self.is_postgres = _is_postgres_target(path)
+        if self.is_postgres:
+            # Schema for Postgres is owned by the committed Supabase migration
+            # (supabase/migrations/...), so we skip the SQLite SCHEMA/_migrate/PRAGMA path.
+            self.path = None
+            self.conn = _PgConnection(path)
+        else:
+            self.path = Path(path)
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            self.conn = sqlite3.connect(self.path)
+            self.conn.row_factory = sqlite3.Row
+            self.conn.executescript(SCHEMA)
+            self._migrate()
+            self.conn.commit()
+
+    def _json(self, obj: Any) -> Any:
+        """Adapt a JSON payload for the active backend: a JSON text string for SQLite TEXT
+        columns, or a psycopg ``Jsonb`` wrapper for Postgres ``jsonb`` columns. Accepts either a
+        Python object or an already-serialized JSON string."""
+        if obj is None:
+            return None
+        text = obj if isinstance(obj, str) else json.dumps(obj, default=str)
+        if self.is_postgres:
+            from psycopg.types.json import Jsonb
+
+            return Jsonb(text, dumps=lambda s: s)
+        return text
+
+    def _insert(self, sql: str, params: tuple) -> int:
+        """Run an INSERT and return the new row id (``RETURNING id`` on Postgres,
+        ``lastrowid`` on SQLite)."""
+        if self.is_postgres:
+            cur = self.conn.execute(sql + " RETURNING id", params)
+            row = cur.fetchone()
+            return int(row[0])
+        cur = self.conn.execute(sql, params)
         self.conn.commit()
+        return int(cur.lastrowid)
 
     def _migrate(self) -> None:
         for name, ddl in {
@@ -233,9 +347,7 @@ class Store:
         return any(row[1] == column for row in self.conn.execute(f"PRAGMA table_info({table})"))
 
     def create_scan(self, market_limit: int, notes: str | None = None) -> int:
-        cur = self.conn.execute("INSERT INTO scans (market_limit, notes) VALUES (?, ?)", (market_limit, notes))
-        self.conn.commit()
-        return int(cur.lastrowid)
+        return self._insert("INSERT INTO scans (market_limit, notes) VALUES (?, ?)", (market_limit, notes))
 
     def insert_signal(self, scan_id: int, row: dict[str, Any]) -> int:
         keys = [
@@ -246,12 +358,10 @@ class Store:
             "edge_cents", "fee_cents", "fee_adjusted_ev_cents", "skipped_reason",
         ]
         data = {**row, "scan_id": scan_id}
-        cur = self.conn.execute(
+        return self._insert(
             f"INSERT INTO signals ({', '.join(keys)}) VALUES ({', '.join('?' for _ in keys)})",
             tuple(data.get(k) for k in keys),
         )
-        self.conn.commit()
-        return int(cur.lastrowid)
 
     def insert_order(self, scan_id: int, signal_id: int, row: dict[str, Any]) -> int:
         keys = [
@@ -259,43 +369,30 @@ class Store:
             "avg_fill_price_cents", "fee_cents", "status", "reason",
         ]
         data = {**row, "scan_id": scan_id, "signal_id": signal_id}
-        cur = self.conn.execute(
+        return self._insert(
             f"INSERT INTO paper_orders ({', '.join(keys)}) VALUES ({', '.join('?' for _ in keys)})",
             tuple(data.get(k) for k in keys),
         )
-        self.conn.commit()
-        return int(cur.lastrowid)
 
     def insert_demo_order(self, scan_id: int, signal_id: int, row: dict[str, Any]) -> int:
-        import json
-
         keys = [
             "scan_id", "signal_id", "local_order_id", "ticker", "client_order_id", "kalshi_order_id",
             "side", "quantity", "price_dollars", "status", "response_json", "error",
         ]
         data = {**row, "scan_id": scan_id, "signal_id": signal_id}
-        if data.get("response_json") is not None and not isinstance(data["response_json"], str):
-            data["response_json"] = json.dumps(data["response_json"])
-        cur = self.conn.execute(
+        data["response_json"] = self._json(data.get("response_json"))
+        return self._insert(
             f"INSERT INTO demo_orders ({', '.join(keys)}) VALUES ({', '.join('?' for _ in keys)})",
             tuple(data.get(k) for k in keys),
         )
-        self.conn.commit()
-        return int(cur.lastrowid)
 
     def insert_demo_snapshot(self, balance: dict[str, Any] | None, positions: dict[str, Any] | None) -> int:
-        import json
-
-        cur = self.conn.execute(
+        return self._insert(
             "INSERT INTO demo_snapshots (balance_json, positions_json) VALUES (?, ?)",
-            (json.dumps(balance) if balance is not None else None, json.dumps(positions) if positions is not None else None),
+            (self._json(balance), self._json(positions)),
         )
-        self.conn.commit()
-        return int(cur.lastrowid)
 
     def insert_shadow_snapshot(self, scan_id: int, row: dict[str, Any]) -> int:
-        import json
-
         keys = [
             "scan_id", "ticker", "title", "city", "target_date", "target_hour", "market_status", "close_time",
             "band_lower", "band_upper", "event_ticker", "lookahead_risk",
@@ -305,14 +402,11 @@ class Store:
             "fee_adjusted_ev_cents", "skipped_reason", "orderbook_json",
         ]
         data = {**row, "scan_id": scan_id}
-        if data.get("orderbook_json") is not None and not isinstance(data["orderbook_json"], str):
-            data["orderbook_json"] = json.dumps(data["orderbook_json"], default=str)
-        cur = self.conn.execute(
+        data["orderbook_json"] = self._json(data.get("orderbook_json"))
+        return self._insert(
             f"INSERT INTO shadow_snapshots ({', '.join(keys)}) VALUES ({', '.join('?' for _ in keys)})",
             tuple(data.get(k) for k in keys),
         )
-        self.conn.commit()
-        return int(cur.lastrowid)
 
     def insert_shadow_order(self, scan_id: int, snapshot_id: int, row: dict[str, Any]) -> int:
         keys = [
@@ -320,34 +414,88 @@ class Store:
             "avg_fill_price_cents", "fee_cents", "status", "reason",
         ]
         data = {**row, "scan_id": scan_id, "snapshot_id": snapshot_id}
-        cur = self.conn.execute(
+        return self._insert(
             f"INSERT INTO shadow_orders ({', '.join(keys)}) VALUES ({', '.join('?' for _ in keys)})",
             tuple(data.get(k) for k in keys),
         )
-        self.conn.commit()
-        return int(cur.lastrowid)
 
     def insert_runner_event(self, level: str, message: str) -> int:
-        cur = self.conn.execute("INSERT INTO runner_events (level, message) VALUES (?, ?)", (level, message))
-        self.conn.commit()
-        return int(cur.lastrowid)
+        return self._insert("INSERT INTO runner_events (level, message) VALUES (?, ?)", (level, message))
 
     def count_orders_today(self) -> int:
-        row = self.conn.execute("SELECT COUNT(*) FROM paper_orders WHERE status IN ('FILLED', 'SETTLED') AND date(created_at) = date('now', 'localtime')").fetchone()
+        if self.is_postgres:
+            row = self.conn.execute(
+                "SELECT COUNT(*) FROM paper_orders WHERE status IN ('FILLED', 'SETTLED') AND created_at::date = current_date"
+            ).fetchone()
+        else:
+            row = self.conn.execute(
+                "SELECT COUNT(*) FROM paper_orders WHERE status IN ('FILLED', 'SETTLED') AND date(created_at) = date('now', 'localtime')"
+            ).fetchone()
         return int(row[0])
 
     def count_orders_since(self, ticker: str, side: str, minutes: int) -> int:
-        row = self.conn.execute(
-            """
-            SELECT COUNT(*)
-            FROM paper_orders
-            WHERE status IN ('FILLED', 'SETTLED')
-              AND ticker = ?
-              AND side = ?
-              AND created_at >= datetime('now', ?)
-            """,
-            (ticker, side, f"-{minutes} minutes"),
-        ).fetchone()
+        if self.is_postgres:
+            row = self.conn.execute(
+                """
+                SELECT COUNT(*)
+                FROM paper_orders
+                WHERE status IN ('FILLED', 'SETTLED')
+                  AND ticker = ?
+                  AND side = ?
+                  AND created_at >= now() - make_interval(mins => ?)
+                """,
+                (ticker, side, minutes),
+            ).fetchone()
+        else:
+            row = self.conn.execute(
+                """
+                SELECT COUNT(*)
+                FROM paper_orders
+                WHERE status IN ('FILLED', 'SETTLED')
+                  AND ticker = ?
+                  AND side = ?
+                  AND created_at >= datetime('now', ?)
+                """,
+                (ticker, side, f"-{minutes} minutes"),
+            ).fetchone()
+        return int(row[0])
+
+    def count_shadow_orders_today(self) -> int:
+        if self.is_postgres:
+            row = self.conn.execute(
+                "SELECT COUNT(*) FROM shadow_orders WHERE status IN ('SHADOW_FILLED', 'SHADOW_SETTLED') AND created_at::date = current_date"
+            ).fetchone()
+        else:
+            row = self.conn.execute(
+                "SELECT COUNT(*) FROM shadow_orders WHERE status IN ('SHADOW_FILLED', 'SHADOW_SETTLED') AND date(created_at) = date('now', 'localtime')"
+            ).fetchone()
+        return int(row[0])
+
+    def count_shadow_orders_since(self, ticker: str, side: str, minutes: int) -> int:
+        if self.is_postgres:
+            row = self.conn.execute(
+                """
+                SELECT COUNT(*)
+                FROM shadow_orders
+                WHERE status IN ('SHADOW_FILLED', 'SHADOW_SETTLED')
+                  AND ticker = ?
+                  AND side = ?
+                  AND created_at >= now() - make_interval(mins => ?)
+                """,
+                (ticker, side, minutes),
+            ).fetchone()
+        else:
+            row = self.conn.execute(
+                """
+                SELECT COUNT(*)
+                FROM shadow_orders
+                WHERE status IN ('SHADOW_FILLED', 'SHADOW_SETTLED')
+                  AND ticker = ?
+                  AND side = ?
+                  AND created_at >= datetime('now', ?)
+                """,
+                (ticker, side, f"-{minutes} minutes"),
+            ).fetchone()
         return int(row[0])
 
     def has_opposite_position(self, ticker: str, side: str) -> bool:
@@ -409,6 +557,61 @@ class Store:
         ).fetchone()
         return float(row[0] or 0.0)
 
+    # --- shadow_orders safety/exposure queries (mirror the paper helpers above) ---
+
+    def shadow_has_opposite_position(self, ticker: str, side: str) -> bool:
+        opposite = "BUY_NO" if side == "BUY_YES" else "BUY_YES"
+        row = self.conn.execute(
+            "SELECT COALESCE(SUM(quantity), 0) FROM shadow_orders WHERE status = 'SHADOW_FILLED' AND ticker = ? AND side = ? AND realized_pnl_cents IS NULL",
+            (ticker, opposite),
+        ).fetchone()
+        return int(row[0] or 0) > 0
+
+    def shadow_position_quantity(self, ticker: str, side: str | None = None) -> int:
+        if side is None:
+            row = self.conn.execute("SELECT COALESCE(SUM(quantity), 0) FROM shadow_orders WHERE status = 'SHADOW_FILLED' AND ticker = ? AND realized_pnl_cents IS NULL", (ticker,)).fetchone()
+        else:
+            row = self.conn.execute("SELECT COALESCE(SUM(quantity), 0) FROM shadow_orders WHERE status = 'SHADOW_FILLED' AND ticker = ? AND side = ? AND realized_pnl_cents IS NULL", (ticker, side)).fetchone()
+        return int(row[0]) if row else 0
+
+    def shadow_total_open_exposure_cents(self) -> float:
+        row = self.conn.execute(
+            """
+            SELECT COALESCE(SUM(quantity * avg_fill_price_cents), 0)
+            FROM shadow_orders
+            WHERE status = 'SHADOW_FILLED' AND realized_pnl_cents IS NULL
+            """
+        ).fetchone()
+        return float(row[0] or 0.0)
+
+    def shadow_event_order_quantity(self, event_ticker: str) -> int:
+        row = self.conn.execute(
+            "SELECT COALESCE(SUM(quantity), 0) FROM shadow_orders WHERE status IN ('SHADOW_FILLED', 'SHADOW_SETTLED') AND ticker LIKE ?",
+            (f"{event_ticker}-%",),
+        ).fetchone()
+        return int(row[0]) if row else 0
+
+    def shadow_event_position_quantity(self, event_ticker: str, side: str | None = None) -> int:
+        like = f"{event_ticker}-%"
+        if side is None:
+            row = self.conn.execute(
+                "SELECT COALESCE(SUM(quantity), 0) FROM shadow_orders WHERE status = 'SHADOW_FILLED' AND ticker LIKE ? AND realized_pnl_cents IS NULL",
+                (like,),
+            ).fetchone()
+        else:
+            row = self.conn.execute(
+                "SELECT COALESCE(SUM(quantity), 0) FROM shadow_orders WHERE status = 'SHADOW_FILLED' AND ticker LIKE ? AND side = ? AND realized_pnl_cents IS NULL",
+                (like, side),
+            ).fetchone()
+        return int(row[0]) if row else 0
+
+    def shadow_event_open_exposure_cents(self, event_ticker: str) -> float:
+        row = self.conn.execute(
+            "SELECT COALESCE(SUM(quantity * avg_fill_price_cents), 0) FROM shadow_orders WHERE status = 'SHADOW_FILLED' AND ticker LIKE ? AND realized_pnl_cents IS NULL",
+            (f"{event_ticker}-%",),
+        ).fetchone()
+        return float(row[0] or 0.0)
+
     def unsettled_order_tickers(self) -> list[str]:
         return [
             str(row[0])
@@ -418,8 +621,6 @@ class Store:
         ]
 
     def settle_paper_orders_for_market(self, ticker: str, market: dict[str, Any]) -> int:
-        import json
-
         result = _normalize_result(market.get("result") or market.get("expiration_value"))
         status = str(market.get("status") or "").lower()
         if result not in {"yes", "no"}:
@@ -444,7 +645,7 @@ class Store:
                 SET settlement_status=?, settlement_result=?, settled_at=?, payout_cents=?, realized_pnl_cents=?, settlement_json=?, status=?, result_value=?
                 WHERE id=?
                 """,
-                (status or "settled", result.upper(), settled_at, payout, pnl, json.dumps(market, default=str), "SETTLED", result_value, row["id"]),
+                (status or "settled", result.upper(), settled_at, payout, pnl, self._json(market), "SETTLED", result_value, row["id"]),
             )
             count += 1
         self.conn.commit()
@@ -459,8 +660,6 @@ class Store:
         ]
 
     def settle_shadow_orders_for_market(self, ticker: str, market: dict[str, Any]) -> int:
-        import json
-
         result = _normalize_result(market.get("result") or market.get("expiration_value"))
         status = str(market.get("status") or "").lower()
         if result not in {"yes", "no"}:
@@ -485,7 +684,7 @@ class Store:
                 SET settlement_status=?, settlement_result=?, settled_at=?, payout_cents=?, realized_pnl_cents=?, settlement_json=?, status=?, result_value=?
                 WHERE id=?
                 """,
-                (status or "settled", result.upper(), settled_at, payout, pnl, json.dumps(market, default=str), "SHADOW_SETTLED", result_value, row["id"]),
+                (status or "settled", result.upper(), settled_at, payout, pnl, self._json(market), "SHADOW_SETTLED", result_value, row["id"]),
             )
             count += 1
         self.conn.commit()
@@ -505,10 +704,16 @@ class Store:
             new_qty = old_qty + quantity
             avg = ((old_qty * float(existing["avg_price_cents"])) + (quantity * price_cents)) / new_qty
             fees = float(existing["total_fees_cents"]) + fee_cents
-            self.conn.execute(
-                "UPDATE paper_positions SET quantity=?, avg_price_cents=?, total_fees_cents=?, updated_at=CURRENT_TIMESTAMP WHERE ticker=? AND side=?",
-                (new_qty, avg, fees, ticker, side),
-            )
+            if self.is_postgres:
+                self.conn.execute(
+                    "UPDATE paper_positions SET quantity=?, avg_price_cents=?, total_fees_cents=?, updated_at=now() WHERE ticker=? AND side=?",
+                    (new_qty, avg, fees, ticker, side),
+                )
+            else:
+                self.conn.execute(
+                    "UPDATE paper_positions SET quantity=?, avg_price_cents=?, total_fees_cents=?, updated_at=CURRENT_TIMESTAMP WHERE ticker=? AND side=?",
+                    (new_qty, avg, fees, ticker, side),
+                )
         else:
             self.conn.execute(
                 "INSERT INTO paper_positions (ticker, side, quantity, avg_price_cents, total_fees_cents) VALUES (?, ?, ?, ?, ?)",

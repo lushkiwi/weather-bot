@@ -22,7 +22,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     settings = Settings()
-    store = Store(args.db)
+    store = Store(settings.database_url or args.db)
     tracker = ProductionShadowTracker(
         settings,
         store,
@@ -45,7 +45,7 @@ def main(argv: list[str] | None = None) -> int:
     if settled is not None:
         print(f"shadow_settlement_markets_checked: {settled.markets_checked}")
         print(f"shadow_orders_settled: {settled.orders_settled}")
-    print(f"db: {args.db}")
+    print(f"db: {'postgres' if settings.database_url else args.db}")
     print(f"total_shadow_snapshots: {summary['shadow_snapshots']}")
     print(f"total_shadow_orders: {summary['shadow_orders']}")
     return 0
