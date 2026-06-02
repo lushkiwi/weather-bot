@@ -89,7 +89,17 @@ python -m compileall src
 
 ## Architecture
 
-Single SQLite file `data/kalshi_weather.sqlite` (WAL mode) is the source of truth for all modes. Schema lives in `storage.py` (`Store`); tables: `scans`, `signals`, `paper_orders`, `paper_positions`, `demo_orders`, `demo_snapshots`, `shadow_snapshots`, `shadow_orders`, plus runner events. New columns are added idempotently in `Store._migrate` (and must also be added to the `insert_signal`/`insert_shadow_snapshot` key lists). Notable added columns: `band_lower`/`band_upper`/`event_ticker`/`lookahead_risk` on signals & snapshots; `result_value` on orders.
+`storage.py` (`Store`) is the data layer and is **dual-backend**: when `DATABASE_URL` is set it uses
+**Supabase/Postgres** (psycopg, via a translating connection wrapper — `?`→`%s`, `RETURNING id`,
+`sqlite3.Row`-like rows, `jsonb` adaptation, autocommit, prepared statements disabled for the
+pgbouncer pooler); when blank it uses the local **SQLite** file `data/kalshi_weather.sqlite` (WAL
+mode) for development. Same tables either way: `scans`, `signals`, `paper_orders`, `paper_positions`,
+`demo_orders`, `demo_snapshots`, `shadow_snapshots`, `shadow_orders`, plus runner events. On SQLite,
+new columns are added idempotently in `Store._migrate` (and must also be added to the
+`insert_signal`/`insert_shadow_snapshot` key lists); on Postgres the schema is owned by the committed
+`supabase/migrations/` file (the `_migrate`/PRAGMA path is skipped). A few SQLite-only date functions
+(`date('now')`, `datetime('now', ?)`) are branched to Postgres equivalents (`current_date`,
+`make_interval`) inside `Store`. Notable added columns: `band_lower`/`band_upper`/`event_ticker`/`lookahead_risk` on signals & snapshots; `result_value` on orders.
 
 ### Scan pipeline (`paper.py` `PaperTrader.run_once`)
 
@@ -113,7 +123,7 @@ Skip reasons (recorded on the signal) drive dashboard metrics; `no_executable_li
 
 ### Layers
 
-- `config.py` — `Settings` (pydantic-settings, reads `.env`). Holds series list, base URLs, limits, `min_edge_cents`. `safety.py` has its own `SafetySettings`.
+- `config.py` — `Settings` (pydantic-settings, reads `.env`). Holds series list, base URLs, limits, `min_edge_cents`, and `database_url` (`DATABASE_URL`; selects the Postgres vs SQLite `Store` backend). `safety.py` has its own `SafetySettings`.
 - `kalshi_client.py` — authenticated REST client. Signs `timestamp+method+path` with RSA-PSS/SHA256 (`cryptography`). Has 429 retry/backoff and embeds response body in `HTTPError`. `is_demo` gates execution. Demo `/portfolio/positions` is queried without params (some param combos return 401).
 - `safety.py` — `SafetyGuard`: min fee-adjusted EV, minimum selected-side win probability (`MIN_TRADE_PROBABILITY`), side-aware price bounds, max orders/day, per-market cooldown, opposite-side block, max contracts/market, **per-event caps** (`DISALLOW_MULTIPLE_POSITIONS_PER_EVENT`, `MAX_CONTRACTS_PER_EVENT`, `MAX_EVENT_EXPOSURE_CENTS`; `_event_ticker` groups per city/day/**hour**), max total exposure. All from env.
 - `probability.py` — normal-CDF fair value. `_sigma(variable, lead_days)` (recalibrated wider 2026-05-28); band + `direct_probability` (rain) branches; clamps to [0.01, 0.99]. Also exposes `strike_spacing` + `forecast_resolves_strikes` for the uncertainty gate. Calibrate `_sigma` further from `kalshi-weather-calib` as data settles.
@@ -122,7 +132,7 @@ Skip reasons (recorded on the signal) drive dashboard metrics; `no_executable_li
 - `demo_execution.py` — demo-only FOK order backend (`buy_yes_fok`, `buy_no_fok`, `snapshot_portfolio`).
 - `shadow.py` / `shadow_cli.py` — Phase 2.75: same scan logic against the production read API, writes `shadow_snapshots`/`shadow_orders`, tracks shadow P/L separately. Never posts orders.
 - `pnl.py` / `pnl_cli.py` — `reconcile_paper_settlements`: checks unsettled tickers against Kalshi results, writes payout/realized P/L back to `paper_orders`.
-- `runner.py` — loops: `PaperTrader.run_once` → `reconcile_paper_settlements` → optional `ProductionShadowTracker`. Logs each iteration as a runner event.
+- `runner.py` — loops: `PaperTrader.run_once` → `reconcile_paper_settlements` → optional `ProductionShadowTracker`. Logs each iteration as a runner event. `--shadow-only` skips the paper/demo path entirely (no primary `KalshiClient`/`DemoExecutor`) and runs just the read-only production shadow scan + settlement; this is what the cloud cron runs (`--once --production-shadow --shadow-only`). All CLIs prefer `settings.database_url` over the `--db` SQLite path.
 - `app.py` — runs `web_ui` dashboard + background runner together.
 - `web_ui.py` — stdlib HTTP dashboard reading the SQLite store (scan counts, side mix, skip reasons, orders, shadow snapshots/fills, realized P/L, open exposure, win rate).
 
@@ -133,3 +143,25 @@ All runtime config is env-driven via `.env` (see `.env.example`). Auth requires 
 Shadow tracking needs **real production read credentials** — `KALSHI_SHADOW_API_KEY_ID` + `KALSHI_SHADOW_PRIVATE_KEY_PATH` (or `KALSHI_SHADOW_PRIVATE_KEY`), which `shadow.py` overrides into a production `Settings` copy. They fall back to the primary keys, but the production API rejects demo keys, so without real production creds `shadow_snapshots` stays empty. Safety/event caps: `MAX_CONTRACTS_PER_EVENT`, `MAX_EVENT_EXPOSURE_CENTS`.
 
 `.env`, `data/`, `*.sqlite`, and the `.pem`/`.txt.bak` key files are gitignored (not all are removed from disk). Never commit credentials or the private key.
+
+## Cloud deployment (2026-06-02)
+
+The bot was migrated off the self-hosted Windows box to the cloud. Full details + service IDs are in
+`docs/deployment.md` and the project memory; the essentials:
+
+- **Supabase Postgres** (project `weather-bot`, ref `xtttchcsmlzjsxcnrttb`) holds all ledger tables;
+  schema = the committed `supabase/migrations/` file. App connects via the session-pooler
+  `DATABASE_URL` (a Railway secret).
+- **Railway** project `weather-bot`, two services from GitHub `lushkiwi/weather-bot`:
+  - `runner` — cron `*/10 * * * *`, restart NEVER, runs
+    `python -m kalshi_weather_bot.runner --once --production-shadow --shadow-only --limit 50`.
+  - `dashboard` — always-on web (`kalshi-weather-web --host 0.0.0.0`, binds `$PORT`), public URL.
+- **Build**: a root `Dockerfile` (`pip install .`) is required — Railway's RAILPACK/Nixpacks builders
+  do not install this src-layout package, so console scripts / `python -m` fail. Each service has
+  `dockerfilePath=Dockerfile` set (the `Builder` enum has no DOCKERFILE value; `dockerfilePath` is
+  what forces Docker). Do not delete the Dockerfile.
+- **Deploys**: not auto-on-push yet — trigger via the Railway GraphQL API
+  (`serviceInstanceDeploy(..., latestCommit:true)`) using the CLI token at
+  `~/.railway/config.json` → `.user.accessToken`. The Railway **MCP** tools return Unauthorized for
+  this project; use the CLI or GraphQL. Connect the Railway GitHub App for true push-to-deploy.
+- Safety unchanged: cloud runs **shadow-only / read-only**; no demo orders, no live trading.

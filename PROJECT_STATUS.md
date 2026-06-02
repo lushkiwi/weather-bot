@@ -13,6 +13,23 @@ Phase 2.5 is implemented and running:
 
 Current implementation now includes **Phase 2.75 production-market shadow tracking**.
 
+## 2026-06-02 cloud migration (now hosted on Railway + Supabase)
+The bot no longer runs self-hosted on Windows. It is deployed to the cloud:
+- **Supabase Postgres** (project `weather-bot`, ref `xtttchcsmlzjsxcnrttb`) is the hosted database;
+  `storage.py` `Store` is now **dual-backend** (Postgres when `DATABASE_URL` is set, SQLite locally).
+- **Railway** runs two services from GitHub `lushkiwi/weather-bot`: a cron **`runner`**
+  (`*/10 * * * *`, `python -m kalshi_weather_bot.runner --once --production-shadow --shadow-only --limit 50`)
+  and an always-on **`dashboard`** (public `*.up.railway.app` URL, reads Supabase).
+- New `runner --shadow-only` flag runs only the read-only production shadow scan (no demo client),
+  so the cron needs only production read creds. **No live trading; no demo orders in the cloud.**
+- Build uses a root **`Dockerfile`** with `dockerfilePath` set per service (Railway's Railpack/Nixpacks
+  builders don't install this src-layout package). Deploys are triggered via the Railway GraphQL API
+  (auto-deploy-on-push not yet wired). Verified end-to-end: a cron run scanned 169 live markets and
+  wrote 37 shadow snapshots / 3 shadow fills to Supabase; the dashboard renders them.
+
+Full details, service IDs, and env vars: `docs/deployment.md`. The model-quality status and all
+trading caveats below are unchanged by the migration.
+
 ## 2026-05-28 algorithm audit fixes (Findings 0–5)
 A code/data audit (see `~/.claude/plans/analyze-the-algorithm-and-golden-sutherland.md`) found and fixed:
 - **F0 shadow was recording nothing.** `start_demo_bot.bat` now passes `--production-shadow`. Production shadow reads now use dedicated, optional credentials (`KALSHI_SHADOW_API_KEY_ID` / `KALSHI_SHADOW_PRIVATE_KEY_PATH` / `KALSHI_SHADOW_PRIVATE_KEY`, falling back to the primary keys) — the external production API rejects demo keys. **Set these to a real production read key or shadow stays empty.**

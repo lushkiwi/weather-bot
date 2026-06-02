@@ -4,6 +4,8 @@
 
 > **Status (2026-05-29): shadow tracking exposed losses; risk controls were tightened again; prior data archived.** A from-the-data audit found the dominant driver was **correlated-ladder over-betting** (the first -74¢ was one event where the bot stacked 6 same-direction bets), not just the too-tight `probability._sigma`. Shipped: `BEST_STRIKE_PER_EVENT`, a wider recalibrated `_sigma`, a conservative `FORECAST_UNCERTAINTY_GATE_RATIO=1.0`, across-scan event lockout, and `MIN_TRADE_PROBABILITY=0.55`. Previous trades/results were archived to `data/archive/kalshi_weather_20260529_134719.sqlite`, and the live DB was reset for fresh post-fix evaluation. Still open: forecast bias-correction + re-calibration after more post-reset days. See `PROJECT_STATUS.md`.
 
+> **Infra (2026-06-02): now cloud-hosted.** Migrated off self-hosted Windows to **Railway** (cron `runner` every 10 min + always-on `dashboard`) backed by **Supabase Postgres**, code on GitHub. The cron runs `--shadow-only` (read-only production shadow; no demo orders, **no live trading** — Phase 3 below is still gated). `Store` is dual-backend (Postgres via `DATABASE_URL`, else local SQLite). See `docs/deployment.md` and `PROJECT_STATUS.md`.
+
 ## Goal
 Build a weather-market edge scanner and trading system for Kalshi. Phase 1 is read-only: discover open weather markets, estimate fair probabilities from external weather forecasts, compare against Kalshi orderbook prices, and rank potential edges. No orders are placed in Phase 1.
 

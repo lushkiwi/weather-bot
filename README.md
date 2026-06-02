@@ -6,16 +6,26 @@ Current operating mode: demo execution plus local paper tracking plus **producti
 
 For fresh-agent handoff, start with `PROJECT_STATUS.md`, then `plan.md`.
 
+## Hosting (cloud)
+
+This bot is deployed on **Railway** (a `*/10 * * * *` cron `runner` service + an always-on
+`dashboard` service) backed by **Supabase Postgres**, with code on GitHub. The cron runs
+`--shadow-only` (read-only production shadow; no demo orders, no live trading). See
+[`docs/deployment.md`](docs/deployment.md) for the full architecture, service IDs, env vars, and
+operating notes. The instructions below are for **local development**, which still uses SQLite.
+
 ## Setup
 
 ```bash
 python -m venv .venv
-. .venv/Scripts/activate  # Windows PowerShell: .venv\\Scripts\\Activate.ps1
+. .venv/bin/activate            # macOS/Linux; Windows PowerShell: .venv\\Scripts\\Activate.ps1
 pip install -e .
 cp .env.example .env
 ```
 
-Fill in `.env` with Kalshi credentials.
+Fill in `.env` with Kalshi credentials. Leave `DATABASE_URL` blank for local SQLite; set it to a
+Supabase/Postgres connection string to run against hosted Postgres (the `Store` switches backends
+automatically).
 
 ## Required environment
 
@@ -40,6 +50,8 @@ KALSHI_SHADOW_PRIVATE_KEY_PATH=C:/path/to/production_key.pem
 KALSHI_MARKET_LIMIT=50
 KALSHI_SERIES_TICKERS=KXTEMPNYCH,KXTEMPCHIH,KXTEMPBOSH,KXTEMPDCH,KXTEMPLAXH,KXTEMPMIAH,KXHIGHAUS,KXHIGHCHI,KXHIGHDEN,KXHIGHHOU,KXPHILHIGH,KXHIGHTSEA,KXHIGHTSFO,KXHIGHNY,KXHIGHMIA,KXLOWTAUS,KXLOWTCHI,KXLOWTBOS,KXLOWNYC,KXLOWLAX,KXRAINAUSM,KXRAINCHIM,KXRAINDALM,KXRAINHOUM,KXRAINLAXM,KXRAINMIAM,KXRAINNYC
 MIN_EDGE_CENTS=3
+# Hosted Postgres (Supabase). Blank = local SQLite. When set, every CLI uses Postgres.
+DATABASE_URL=postgresql://USER:PASSWORD@HOST:5432/postgres
 ```
 
 ## Run
@@ -70,7 +82,7 @@ This records signals, fee-adjusted EV, hypothetical fills, and local paper posit
 python -m kalshi_weather_bot.paper_cli --limit 50
 ```
 
-Database:
+Database (local dev = SQLite; cloud = Supabase Postgres via `DATABASE_URL`):
 
 ```text
 data/kalshi_weather.sqlite
@@ -184,6 +196,14 @@ kalshi-weather-runner --limit 50 --execute-demo --production-shadow --interval-s
 
 A 15-minute cadence is acceptable for the first production-shadow run. Faster 3–5 minute scans may be needed later for near-close hourly temperature markets.
 
+**Shadow-only mode (what the cloud cron runs):** `--shadow-only` skips the demo-API paper scan and
+the demo client entirely, running just the read-only production shadow scan + settlement. It needs
+only production read credentials, which is why it is the deployed cron command:
+
+```bash
+kalshi-weather-runner --once --production-shadow --shadow-only --limit 50
+```
+
 ## Paper settlement / P&L
 
 Reconcile settled Kalshi markets and update local paper P/L:
@@ -222,6 +242,9 @@ Then open:
 ```text
 http://127.0.0.1:8787
 ```
+
+In the cloud the same dashboard runs on Railway (binds `0.0.0.0:$PORT`, reads Supabase) at its
+generated `*.up.railway.app` URL — see `docs/deployment.md`.
 
 The dashboard shows scan counts, graphs, skip reasons, selected side mix, YES/NO paper orders, demo orders, production-shadow snapshots/fills, cooldown/safety skips, realized P/L, open exposure, win rate, P/L by side, and open local paper positions. It also has a button to run a new local paper scan.
 
