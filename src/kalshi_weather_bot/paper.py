@@ -6,11 +6,12 @@ from datetime import date, datetime, timezone
 from .config import Settings
 from .demo_execution import DemoExecutor
 from .fees import FeeModel
+from .forecast_adjustments import apply_forecast_adjustments
 from .kalshi_client import KalshiClient
 from .market_parser import parse_market
 from .models import WeatherVariable
 from .orderbook import parse_market_quote, parse_orderbook
-from .probability import estimate_probability, forecast_resolves_strikes, strike_spacing
+from .probability import base_sigma, estimate_probability, forecast_resolves_strikes, strike_spacing
 from .safety import SafetyGuard
 from .stations import station_for_ticker
 from .storage import Store
@@ -163,8 +164,23 @@ class PaperTrader:
             market.get("yes_bid_size_fp"),
         )
 
+        adjustment = apply_forecast_adjustments(
+            store=self.store,
+            settings=self.settings,
+            ticker=parsed.ticker,
+            variable=parsed.variable,
+            target_date=parsed.target_date,  # type: ignore[arg-type]
+            target_hour=parsed.target_hour,
+            raw_mean=forecast_value,
+            base_sigma=base_sigma(parsed.variable, parsed.target_date),  # type: ignore[arg-type]
+        )
+        source_bits = []
+        if adjustment.used_bias_correction:
+            source_bits.append(f"bias_corrected_n{adjustment.bias_samples}")
+        if adjustment.used_dynamic_sigma:
+            source_bits.append(f"dynamic_sigma_n{adjustment.sigma_samples}")
         estimate = estimate_probability(
-            mean=forecast_value,
+            mean=adjustment.adjusted_mean,
             threshold=parsed.threshold,  # type: ignore[arg-type]
             variable=parsed.variable,
             target_date=parsed.target_date,  # type: ignore[arg-type]
@@ -172,6 +188,8 @@ class PaperTrader:
             band_lower=parsed.band_lower,
             band_upper=parsed.band_upper,
             direct_probability=self._rain_probability(geo[0], geo[1], parsed),
+            sigma_override=adjustment.sigma,
+            source_suffix="+".join(source_bits) if source_bits else None,
         )
         fair_yes = estimate.probability_yes * 100.0
         fair_no = (1.0 - estimate.probability_yes) * 100.0
@@ -205,7 +223,13 @@ class PaperTrader:
             "band_upper": parsed.band_upper,
             "event_ticker": _event_ticker(parsed.ticker),
             "lookahead_risk": int(_is_lookahead(parsed)),
-            "forecast_value": forecast_value,
+            "raw_forecast_value": adjustment.raw_mean,
+            "forecast_value": estimate.mean,
+            "forecast_sigma": estimate.sigma,
+            "model_source": estimate.source,
+            "bias_correction": adjustment.bias_correction,
+            "bias_correction_n": adjustment.bias_samples,
+            "bias_mae": adjustment.bias_mae,
             "probability_yes": estimate.probability_yes,
             "fair_yes_cents": fair_yes,
             "fair_no_cents": fair_no,
@@ -260,6 +284,12 @@ class PaperTrader:
                 default_min_ev_cents=self.settings.min_edge_cents * self.quantity,
                 event_ticker=ev.event_ticker,
                 probability_win=selected.probability_win,
+                series_ticker=parsed.ticker.split("-", 1)[0],
+                target_date=parsed.target_date,
+                target_hour=parsed.target_hour,
+                variable=parsed.variable,
+                band_lower=parsed.band_lower,
+                band_upper=parsed.band_upper,
             )
             if not safety.allowed:
                 skipped = safety.reason

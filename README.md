@@ -2,7 +2,7 @@
 
 Weather-market scanner, local paper trader, BUY YES/BUY NO evaluator, Kalshi demo execution backend, continuous runner, and web dashboard.
 
-Current operating mode: demo execution plus local paper tracking plus **production-market shadow tracking**: read real Kalshi production orderbooks, never place production orders, and measure whether the algorithm's demo/paper edges are actually executable in the real market over several days.
+Current operating mode: **production-market shadow tracking** in the cloud plus optional local demo/paper tools: read real Kalshi production orderbooks, never place production orders, and use the results to debug model quality. As of 2026-06-08, post-reset shadow performance is negative, so this is a research/data-collection bot, not a live-trading candidate.
 
 For fresh-agent handoff, start with `PROJECT_STATUS.md`, then `plan.md`.
 
@@ -222,12 +222,16 @@ trustworthy (this is the go/no-go signal before any live trading):
 ```bash
 kalshi-weather-calib --source shadow
 kalshi-weather-calib --source both --include-lookahead
+kalshi-weather-model-audit --source shadow
+kalshi-weather-counterfactual --source shadow --dry-run --limit 50
 ```
 
 Reports Brier score, log loss, reliability bins (predicted vs empirical hit rate),
-forecast MAE/bias, and independent-event counts. Same-day "leakage" rows
-(`lookahead_risk=1`) are excluded by default. The dashboard shows the headline metrics in a
-"Model calibration" tile.
+forecast MAE/bias/RMSE, and independent-event counts. Same-day "leakage" rows
+(`lookahead_risk=1`) are excluded by default. The dashboard now separates clean vs all calibration
+and flags stale past-close shadow fills. `kalshi-weather-model-audit` groups settled errors by
+series/variable/hour for sigma/bias debugging; `kalshi-weather-counterfactual` audits skipped high-EV
+rows after settlement (dry-run requires no credentials).
 
 ## Web dashboard
 
@@ -262,4 +266,6 @@ The first 18 settled shadow fills went 4 wins / 14 losses (-74¢). A from-the-da
 
 A follow-up audit found two additional causes of the low win rate: repeated scans could still add more strikes from the same event, and the EV selector favored cheap low-probability tail bets. Current defaults therefore allow only one order per event (`DISALLOW_MULTIPLE_POSITIONS_PER_EVENT=true`, `MAX_CONTRACTS_PER_EVENT=1`) and require `MIN_TRADE_PROBABILITY=0.55`.
 
-The model is still **not** ready for live trading. Open work is forecast bias-correction and re-calibration (`kalshi-weather-calib --source shadow`) after more days, not execution.
+Latest post-reset shadow review (2026-06-08, see `observations.md`): 83 shadow fills, 79 settled, **17/79 wins**, **−469¢** realized P/L on 2,169¢ cost basis; first clean/non-lookahead sample is **7 fills, −172¢**. Mean predicted win probability was 69.3% vs 21.5% empirical, so model EV is not trustworthy yet.
+
+The 2026-06-08 model/risk-control pass added sample-gated forecast bias correction, dynamic sigma widening, adjacent-hour/same-day directional caps for hourly temp, expensive BUY_NO guards for rain/bands, stale-shadow alerts, and counterfactual skipped-trade audit tooling. These are still research controls; they do **not** enable live trading or prove profitability.

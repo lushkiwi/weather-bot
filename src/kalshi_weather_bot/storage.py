@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import sqlite3
 from pathlib import Path
 from typing import Any
@@ -23,7 +24,13 @@ CREATE TABLE IF NOT EXISTS signals (
   target_hour INTEGER,
   variable TEXT,
   threshold REAL,
+  raw_forecast_value REAL,
   forecast_value REAL,
+  forecast_sigma REAL,
+  model_source TEXT,
+  bias_correction REAL,
+  bias_correction_n INTEGER,
+  bias_mae REAL,
   probability_yes REAL,
   fair_yes_cents REAL,
   fair_no_cents REAL,
@@ -105,10 +112,18 @@ CREATE TABLE IF NOT EXISTS shadow_snapshots (
   city TEXT,
   target_date TEXT,
   target_hour INTEGER,
+  variable TEXT,
+  threshold REAL,
   market_status TEXT,
   close_time TEXT,
   production_base_url TEXT,
+  raw_forecast_value REAL,
   forecast_value REAL,
+  forecast_sigma REAL,
+  model_source TEXT,
+  bias_correction REAL,
+  bias_correction_n INTEGER,
+  bias_mae REAL,
   probability_yes REAL,
   fair_yes_cents REAL,
   fair_no_cents REAL,
@@ -156,6 +171,25 @@ CREATE TABLE IF NOT EXISTS runner_events (
   created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
   level TEXT NOT NULL,
   message TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS counterfactual_outcomes (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  source TEXT NOT NULL,
+  source_row_id INTEGER NOT NULL,
+  ticker TEXT NOT NULL,
+  selected_side TEXT,
+  selected_price_cents REAL,
+  fee_cents REAL,
+  fee_adjusted_ev_cents REAL,
+  skipped_reason TEXT,
+  settlement_result TEXT,
+  result_value REAL,
+  payout_cents REAL,
+  counterfactual_pnl_cents REAL,
+  settlement_json TEXT,
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE(source, source_row_id)
 );
 """
 
@@ -296,6 +330,12 @@ class Store:
             "band_upper": "ALTER TABLE signals ADD COLUMN band_upper REAL",
             "event_ticker": "ALTER TABLE signals ADD COLUMN event_ticker TEXT",
             "lookahead_risk": "ALTER TABLE signals ADD COLUMN lookahead_risk INTEGER",
+            "raw_forecast_value": "ALTER TABLE signals ADD COLUMN raw_forecast_value REAL",
+            "forecast_sigma": "ALTER TABLE signals ADD COLUMN forecast_sigma REAL",
+            "model_source": "ALTER TABLE signals ADD COLUMN model_source TEXT",
+            "bias_correction": "ALTER TABLE signals ADD COLUMN bias_correction REAL",
+            "bias_correction_n": "ALTER TABLE signals ADD COLUMN bias_correction_n INTEGER",
+            "bias_mae": "ALTER TABLE signals ADD COLUMN bias_mae REAL",
         }.items():
             if not self._column_exists("signals", name):
                 self.conn.execute(ddl)
@@ -317,12 +357,44 @@ class Store:
             "band_upper": "ALTER TABLE shadow_snapshots ADD COLUMN band_upper REAL",
             "event_ticker": "ALTER TABLE shadow_snapshots ADD COLUMN event_ticker TEXT",
             "lookahead_risk": "ALTER TABLE shadow_snapshots ADD COLUMN lookahead_risk INTEGER",
+            "variable": "ALTER TABLE shadow_snapshots ADD COLUMN variable TEXT",
+            "threshold": "ALTER TABLE shadow_snapshots ADD COLUMN threshold REAL",
+            "raw_forecast_value": "ALTER TABLE shadow_snapshots ADD COLUMN raw_forecast_value REAL",
+            "forecast_sigma": "ALTER TABLE shadow_snapshots ADD COLUMN forecast_sigma REAL",
+            "model_source": "ALTER TABLE shadow_snapshots ADD COLUMN model_source TEXT",
+            "bias_correction": "ALTER TABLE shadow_snapshots ADD COLUMN bias_correction REAL",
+            "bias_correction_n": "ALTER TABLE shadow_snapshots ADD COLUMN bias_correction_n INTEGER",
+            "bias_mae": "ALTER TABLE shadow_snapshots ADD COLUMN bias_mae REAL",
         }.items():
             if not self._column_exists("shadow_snapshots", name):
                 self.conn.execute(ddl)
 
         if not self._column_exists("shadow_orders", "result_value"):
             self.conn.execute("ALTER TABLE shadow_orders ADD COLUMN result_value REAL")
+
+        self.conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS counterfactual_outcomes (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              source TEXT NOT NULL,
+              source_row_id INTEGER NOT NULL,
+              ticker TEXT NOT NULL,
+              selected_side TEXT,
+              selected_price_cents REAL,
+              fee_cents REAL,
+              fee_adjusted_ev_cents REAL,
+              skipped_reason TEXT,
+              settlement_result TEXT,
+              result_value REAL,
+              payout_cents REAL,
+              counterfactual_pnl_cents REAL,
+              settlement_json TEXT,
+              created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+              updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+              UNIQUE(source, source_row_id)
+            )
+            """
+        )
 
         if not self._column_exists("paper_positions", "side"):
             self.conn.executescript(
@@ -353,7 +425,8 @@ class Store:
         keys = [
             "scan_id", "ticker", "title", "city", "target_date", "target_hour", "variable", "threshold",
             "band_lower", "band_upper", "event_ticker", "lookahead_risk",
-            "forecast_value", "probability_yes", "fair_yes_cents", "fair_no_cents", "yes_bid_cents", "yes_ask_cents",
+            "raw_forecast_value", "forecast_value", "forecast_sigma", "model_source", "bias_correction", "bias_correction_n", "bias_mae",
+            "probability_yes", "fair_yes_cents", "fair_no_cents", "yes_bid_cents", "yes_ask_cents",
             "yes_ask_size", "no_bid_cents", "no_ask_cents", "no_ask_size", "selected_side", "selected_price_cents",
             "edge_cents", "fee_cents", "fee_adjusted_ev_cents", "skipped_reason",
         ]
@@ -394,9 +467,10 @@ class Store:
 
     def insert_shadow_snapshot(self, scan_id: int, row: dict[str, Any]) -> int:
         keys = [
-            "scan_id", "ticker", "title", "city", "target_date", "target_hour", "market_status", "close_time",
+            "scan_id", "ticker", "title", "city", "target_date", "target_hour", "variable", "threshold", "market_status", "close_time",
             "band_lower", "band_upper", "event_ticker", "lookahead_risk",
-            "production_base_url", "forecast_value", "probability_yes", "fair_yes_cents", "fair_no_cents",
+            "production_base_url", "raw_forecast_value", "forecast_value", "forecast_sigma", "model_source", "bias_correction", "bias_correction_n", "bias_mae",
+            "probability_yes", "fair_yes_cents", "fair_no_cents",
             "yes_bid_cents", "yes_ask_cents", "yes_ask_size", "no_bid_cents", "no_ask_cents", "no_ask_size",
             "spread_cents", "selected_side", "selected_price_cents", "edge_cents", "fee_cents",
             "fee_adjusted_ev_cents", "skipped_reason", "orderbook_json",
@@ -612,6 +686,216 @@ class Store:
         ).fetchone()
         return float(row[0] or 0.0)
 
+    # --- model-quality helpers (bias/sigma calibration and directional risk caps) ---
+
+    def forecast_error_stats(
+        self,
+        *,
+        series_ticker: str,
+        variable: str,
+        target_hour: int | None = None,
+        source: str = "both",
+        lookback_days: int = 45,
+        include_lookahead: bool = True,
+    ) -> dict[str, float | int | None]:
+        """Rolling realized forecast error stats for a series/variable/hour key.
+
+        Error is stored as ``forecast_value - result_value``. A positive bias means the forecast
+        ran warm/high and should be subtracted from the next raw forecast. Uses already-settled
+        paper and/or shadow rows; no live orders are involved.
+        """
+        errors: list[float] = []
+        requested = {source.lower()} if source.lower() in {"paper", "shadow"} else {"paper", "shadow"}
+        if "paper" in requested:
+            errors.extend(
+                self._forecast_errors_from_join(
+                    order_table="paper_orders",
+                    signal_table="signals",
+                    signal_fk="signal_id",
+                    order_status="SETTLED",
+                    series_ticker=series_ticker,
+                    variable=variable,
+                    target_hour=target_hour,
+                    lookback_days=lookback_days,
+                    include_lookahead=include_lookahead,
+                    has_variable_column=True,
+                )
+            )
+        if "shadow" in requested:
+            # Historical shadow_snapshots do not have a variable column; the series prefix and
+            # target-hour filter are the stable key. Future schema can add variable without
+            # changing this query.
+            errors.extend(
+                self._forecast_errors_from_join(
+                    order_table="shadow_orders",
+                    signal_table="shadow_snapshots",
+                    signal_fk="snapshot_id",
+                    order_status="SHADOW_SETTLED",
+                    series_ticker=series_ticker,
+                    variable=variable,
+                    target_hour=target_hour,
+                    lookback_days=lookback_days,
+                    include_lookahead=include_lookahead,
+                    has_variable_column=False,
+                )
+            )
+        if not errors:
+            return {"n": 0, "bias": None, "mae": None, "rmse": None}
+        bias = sum(errors) / len(errors)
+        mae = sum(abs(e) for e in errors) / len(errors)
+        rmse = math.sqrt(sum(e * e for e in errors) / len(errors))
+        return {"n": len(errors), "bias": bias, "mae": mae, "rmse": rmse}
+
+    def _forecast_errors_from_join(
+        self,
+        *,
+        order_table: str,
+        signal_table: str,
+        signal_fk: str,
+        order_status: str,
+        series_ticker: str,
+        variable: str,
+        target_hour: int | None,
+        lookback_days: int,
+        include_lookahead: bool,
+        has_variable_column: bool,
+    ) -> list[float]:
+        where = [
+            f"o.status = '{order_status}'",
+            "o.result_value IS NOT NULL",
+            "s.forecast_value IS NOT NULL",
+            "o.ticker LIKE ?",
+        ]
+        params: list[Any] = [f"{series_ticker}-%"]
+        if has_variable_column:
+            where.append("s.variable = ?")
+            params.append(variable)
+        if target_hour is None:
+            where.append("s.target_hour IS NULL")
+        else:
+            where.append("s.target_hour = ?")
+            params.append(target_hour)
+        if not include_lookahead:
+            where.append("COALESCE(s.lookahead_risk, 0) = 0")
+        if lookback_days > 0:
+            if self.is_postgres:
+                where.append("o.created_at >= now() - make_interval(days => ?)")
+                params.append(lookback_days)
+            else:
+                where.append("o.created_at >= datetime('now', ?)")
+                params.append(f"-{lookback_days} days")
+        sql = f"""
+            SELECT COALESCE(s.raw_forecast_value, s.forecast_value) AS fv, o.result_value AS rv
+            FROM {order_table} o
+            JOIN {signal_table} s ON s.id = o.{signal_fk}
+            WHERE {' AND '.join(where)}
+        """
+        out: list[float] = []
+        for row in self.conn.execute(sql, tuple(params)).fetchall():
+            try:
+                out.append(float(row["fv"]) - float(row["rv"]))
+            except (TypeError, ValueError):
+                continue
+        return out
+
+    def same_day_directional_order_quantity(self, series_ticker: str, target_date: str, side: str) -> int:
+        row = self.conn.execute(
+            """
+            SELECT COALESCE(SUM(o.quantity), 0)
+            FROM paper_orders o
+            JOIN signals s ON s.id = o.signal_id
+            WHERE o.status IN ('FILLED', 'SETTLED')
+              AND o.side = ?
+              AND o.ticker LIKE ?
+              AND s.target_date = ?
+              AND s.variable = 'point_temp_f'
+            """,
+            (side, f"{series_ticker}-%", target_date),
+        ).fetchone()
+        return int(row[0] or 0)
+
+    def adjacent_hour_directional_order_quantity(self, series_ticker: str, target_date: str, target_hour: int, side: str, window: int) -> int:
+        lo = max(0, target_hour - window)
+        hi = min(23, target_hour + window)
+        row = self.conn.execute(
+            """
+            SELECT COALESCE(SUM(o.quantity), 0)
+            FROM paper_orders o
+            JOIN signals s ON s.id = o.signal_id
+            WHERE o.status IN ('FILLED', 'SETTLED')
+              AND o.side = ?
+              AND o.ticker LIKE ?
+              AND s.target_date = ?
+              AND s.variable = 'point_temp_f'
+              AND s.target_hour BETWEEN ? AND ?
+            """,
+            (side, f"{series_ticker}-%", target_date, lo, hi),
+        ).fetchone()
+        return int(row[0] or 0)
+
+    def shadow_same_day_directional_order_quantity(self, series_ticker: str, target_date: str, side: str) -> int:
+        row = self.conn.execute(
+            """
+            SELECT COALESCE(SUM(o.quantity), 0)
+            FROM shadow_orders o
+            JOIN shadow_snapshots s ON s.id = o.snapshot_id
+            WHERE o.status IN ('SHADOW_FILLED', 'SHADOW_SETTLED')
+              AND o.side = ?
+              AND o.ticker LIKE ?
+              AND s.target_date = ?
+              AND s.target_hour IS NOT NULL
+            """,
+            (side, f"{series_ticker}-%", target_date),
+        ).fetchone()
+        return int(row[0] or 0)
+
+    def shadow_adjacent_hour_directional_order_quantity(self, series_ticker: str, target_date: str, target_hour: int, side: str, window: int) -> int:
+        lo = max(0, target_hour - window)
+        hi = min(23, target_hour + window)
+        row = self.conn.execute(
+            """
+            SELECT COALESCE(SUM(o.quantity), 0)
+            FROM shadow_orders o
+            JOIN shadow_snapshots s ON s.id = o.snapshot_id
+            WHERE o.status IN ('SHADOW_FILLED', 'SHADOW_SETTLED')
+              AND o.side = ?
+              AND o.ticker LIKE ?
+              AND s.target_date = ?
+              AND s.target_hour BETWEEN ? AND ?
+            """,
+            (side, f"{series_ticker}-%", target_date, lo, hi),
+        ).fetchone()
+        return int(row[0] or 0)
+
+    def stale_shadow_orders(self, hours_after_close: int = 6, limit: int = 40) -> list[dict[str, Any]]:
+        if self.is_postgres:
+            sql = """
+                SELECT o.*, s.close_time, s.event_ticker, s.probability_yes, s.selected_side, s.selected_price_cents
+                FROM shadow_orders o
+                JOIN shadow_snapshots s ON s.id = o.snapshot_id
+                WHERE o.status = 'SHADOW_FILLED'
+                  AND o.realized_pnl_cents IS NULL
+                  AND s.close_time IS NOT NULL
+                  AND s.close_time < now() - make_interval(hours => ?)
+                ORDER BY s.close_time ASC
+                LIMIT ?
+            """
+            params = (hours_after_close, limit)
+        else:
+            sql = """
+                SELECT o.*, s.close_time, s.event_ticker, s.probability_yes, s.selected_side, s.selected_price_cents
+                FROM shadow_orders o
+                JOIN shadow_snapshots s ON s.id = o.snapshot_id
+                WHERE o.status = 'SHADOW_FILLED'
+                  AND o.realized_pnl_cents IS NULL
+                  AND s.close_time IS NOT NULL
+                  AND datetime(s.close_time) < datetime('now', ?)
+                ORDER BY s.close_time ASC
+                LIMIT ?
+            """
+            params = (f"-{hours_after_close} hours", limit)
+        return [dict(row) for row in self.conn.execute(sql, params).fetchall()]
+
     def unsettled_order_tickers(self) -> list[str]:
         return [
             str(row[0])
@@ -689,6 +973,123 @@ class Store:
             count += 1
         self.conn.commit()
         return count
+
+    def counterfactual_candidates(
+        self,
+        *,
+        source: str = "shadow",
+        min_ev_cents: float = 10.0,
+        limit: int = 50,
+        skip_reason: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """High-model-EV skipped rows that can be audited after settlement."""
+        if source == "paper":
+            table = "signals"
+            source_id = "id"
+        else:
+            table = "shadow_snapshots"
+            source_id = "id"
+        where = [
+            "skipped_reason IS NOT NULL",
+            "selected_side IS NOT NULL",
+            "selected_price_cents IS NOT NULL",
+            "fee_adjusted_ev_cents >= ?",
+        ]
+        params: list[Any] = [min_ev_cents]
+        if skip_reason:
+            where.append("skipped_reason = ?")
+            params.append(skip_reason)
+        params.append(limit)
+        sql = f"""
+            SELECT {source_id} AS source_row_id, ticker, selected_side, selected_price_cents,
+                   fee_cents, fee_adjusted_ev_cents, skipped_reason
+            FROM {table}
+            WHERE {' AND '.join(where)}
+            ORDER BY fee_adjusted_ev_cents DESC
+            LIMIT ?
+        """
+        return [dict(row) for row in self.conn.execute(sql, tuple(params)).fetchall()]
+
+    def upsert_counterfactual_outcome(
+        self,
+        *,
+        source: str,
+        source_row_id: int,
+        ticker: str,
+        selected_side: str | None,
+        selected_price_cents: float | None,
+        fee_cents: float | None,
+        fee_adjusted_ev_cents: float | None,
+        skipped_reason: str | None,
+        market: dict[str, Any],
+    ) -> None:
+        result = _normalize_result(market.get("result") or market.get("expiration_value"))
+        result_value = _result_value(market)
+        payout = pnl = None
+        if result in {"yes", "no"} and selected_side and selected_price_cents is not None:
+            won = (selected_side == "BUY_YES" and result == "yes") or (selected_side == "BUY_NO" and result == "no")
+            payout = 100.0 if won else 0.0
+            pnl = payout - float(selected_price_cents) - float(fee_cents or 0.0)
+        payload = self._json(market)
+        if self.is_postgres:
+            self.conn.execute(
+                """
+                INSERT INTO counterfactual_outcomes (
+                  source, source_row_id, ticker, selected_side, selected_price_cents, fee_cents,
+                  fee_adjusted_ev_cents, skipped_reason, settlement_result, result_value, payout_cents,
+                  counterfactual_pnl_cents, settlement_json, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, now())
+                ON CONFLICT (source, source_row_id) DO UPDATE SET
+                  settlement_result=EXCLUDED.settlement_result,
+                  result_value=EXCLUDED.result_value,
+                  payout_cents=EXCLUDED.payout_cents,
+                  counterfactual_pnl_cents=EXCLUDED.counterfactual_pnl_cents,
+                  settlement_json=EXCLUDED.settlement_json,
+                  updated_at=now()
+                """,
+                (source, source_row_id, ticker, selected_side, selected_price_cents, fee_cents,
+                 fee_adjusted_ev_cents, skipped_reason, result.upper() if result else None, result_value,
+                 payout, pnl, payload),
+            )
+        else:
+            self.conn.execute(
+                """
+                INSERT INTO counterfactual_outcomes (
+                  source, source_row_id, ticker, selected_side, selected_price_cents, fee_cents,
+                  fee_adjusted_ev_cents, skipped_reason, settlement_result, result_value, payout_cents,
+                  counterfactual_pnl_cents, settlement_json, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                ON CONFLICT(source, source_row_id) DO UPDATE SET
+                  settlement_result=excluded.settlement_result,
+                  result_value=excluded.result_value,
+                  payout_cents=excluded.payout_cents,
+                  counterfactual_pnl_cents=excluded.counterfactual_pnl_cents,
+                  settlement_json=excluded.settlement_json,
+                  updated_at=CURRENT_TIMESTAMP
+                """,
+                (source, source_row_id, ticker, selected_side, selected_price_cents, fee_cents,
+                 fee_adjusted_ev_cents, skipped_reason, result.upper() if result else None, result_value,
+                 payout, pnl, payload),
+            )
+            self.conn.commit()
+
+    def counterfactual_summary(self, source: str = "shadow") -> list[dict[str, Any]]:
+        return [
+            dict(row)
+            for row in self.conn.execute(
+                """
+                SELECT skipped_reason, COUNT(*) AS n,
+                       SUM(CASE WHEN counterfactual_pnl_cents > 0 THEN 1 ELSE 0 END) AS wins,
+                       COALESCE(SUM(counterfactual_pnl_cents), 0) AS pnl_cents,
+                       AVG(fee_adjusted_ev_cents) AS avg_model_ev_cents
+                FROM counterfactual_outcomes
+                WHERE source = ? AND counterfactual_pnl_cents IS NOT NULL
+                GROUP BY skipped_reason
+                ORDER BY pnl_cents DESC
+                """,
+                (source,),
+            ).fetchall()
+        ]
 
     def mark_order_demo_rejected(self, order_id: int, reason: str | None = None) -> None:
         self.conn.execute(

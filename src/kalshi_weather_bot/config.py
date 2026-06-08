@@ -57,6 +57,30 @@ class Settings(BaseSettings):
     # not an explicit band. Band markets use their own width instead.
     default_strike_spacing_f: float = Field(default=1.0, alias="DEFAULT_STRIKE_SPACING_F")
 
+    # --- Data-driven model calibration (added 2026-06-08 after negative shadow review) ---
+    # Apply a rolling residual correction keyed by series/station, weather variable, and (for
+    # hourly temperature) target hour. The correction uses only already-settled ledger rows; when
+    # there are too few samples, the raw Open-Meteo forecast is used unchanged.
+    enable_forecast_bias_correction: bool = Field(default=True, alias="ENABLE_FORECAST_BIAS_CORRECTION")
+    forecast_bias_min_samples: int = Field(default=3, alias="FORECAST_BIAS_MIN_SAMPLES")
+    forecast_bias_lookback_days: int = Field(default=45, alias="FORECAST_BIAS_LOOKBACK_DAYS")
+    forecast_bias_max_adjustment_f: float = Field(default=6.0, alias="FORECAST_BIAS_MAX_ADJUSTMENT_F")
+    # Shadow rows include the real production-market evidence; local paper rows are useful for
+    # development. "both" is safest locally, while cloud shadow-only effectively means shadow.
+    forecast_bias_source: str = Field(default="both", alias="FORECAST_BIAS_SOURCE")
+    forecast_bias_include_lookahead: bool = Field(default=False, alias="FORECAST_BIAS_INCLUDE_LOOKAHEAD")
+
+    # Inflate sigma from realized residual RMSE where enough rows exist. This deliberately only
+    # widens the hardcoded baseline; it never narrows sigma from a small/noisy sample.
+    enable_dynamic_sigma: bool = Field(default=True, alias="ENABLE_DYNAMIC_SIGMA")
+    dynamic_sigma_min_samples: int = Field(default=5, alias="DYNAMIC_SIGMA_MIN_SAMPLES")
+    dynamic_sigma_multiplier: float = Field(default=1.75, alias="DYNAMIC_SIGMA_MULTIPLIER")
+    dynamic_sigma_max_f: float = Field(default=14.0, alias="DYNAMIC_SIGMA_MAX_F")
+    dynamic_sigma_source: str = Field(default="both", alias="DYNAMIC_SIGMA_SOURCE")
+    dynamic_sigma_include_lookahead: bool = Field(default=False, alias="DYNAMIC_SIGMA_INCLUDE_LOOKAHEAD")
+
+    stale_unsettled_grace_hours: int = Field(default=6, alias="STALE_UNSETTLED_GRACE_HOURS")
+
     # --- Bounded shadow-only data-collection experiment (added 2026-05-30) ---
     # The conservative gate above (ratio 1.0 vs ~1 F strike spacing) is unsatisfiable for every
     # 1 F-spaced temperature ladder given the widened sigma (4.5-5.0 F), so the read-only shadow

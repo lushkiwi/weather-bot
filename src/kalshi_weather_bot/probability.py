@@ -15,14 +15,19 @@ def estimate_probability(
     band_lower: float | None = None,
     band_upper: float | None = None,
     direct_probability: float | None = None,
+    sigma_override: float | None = None,
+    source_suffix: str | None = None,
 ) -> ForecastEstimate:
-    sigma = _sigma(variable, target_date)
+    sigma = sigma_override if sigma_override is not None else _sigma(variable, target_date)
     if direct_probability is not None:
         # Used for "any rain" markets where a forecast precipitation probability is more
         # appropriate than a Gaussian on a zero-inflated, right-skewed rain amount.
         probability_yes = direct_probability if comparator != "<" else 1.0 - direct_probability
         probability_yes = min(max(probability_yes, 0.01), 0.99)
-        return ForecastEstimate(mean=mean, sigma=sigma, probability_yes=probability_yes, source="open-meteo-precip-probability")
+        source = "open-meteo-precip-probability"
+        if source_suffix:
+            source = f"{source}+{source_suffix}"
+        return ForecastEstimate(mean=mean, sigma=sigma, probability_yes=probability_yes, source=source)
     if band_lower is not None and band_upper is not None:
         # Bucket markets resolve YES only when the outcome lands inside [lower, upper).
         # P = Phi((upper - mean)/sigma) - Phi((lower - mean)/sigma); edges already carry
@@ -35,12 +40,19 @@ def estimate_probability(
         probability_yes = p_ge if comparator != "<" else 1.0 - p_ge
         source = "open-meteo-baseline-normal"
     probability_yes = min(max(probability_yes, 0.01), 0.99)
+    if source_suffix:
+        source = f"{source}+{source_suffix}"
     return ForecastEstimate(
         mean=mean,
         sigma=sigma,
         probability_yes=probability_yes,
         source=source,
     )
+
+
+def base_sigma(variable: WeatherVariable, target_date: date) -> float:
+    """Public baseline sigma before settled-ledger dynamic widening."""
+    return _sigma(variable, target_date)
 
 
 def _sigma(variable: WeatherVariable, target_date: date) -> float:

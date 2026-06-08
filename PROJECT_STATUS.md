@@ -3,15 +3,16 @@
 ## Current objective
 Build a Kalshi weather-market bot that can scan weather contracts, estimate fair probabilities, paper trade locally, optionally submit qualifying orders to Kalshi demo, and show results in a local web dashboard.
 
-Near-term objective: run **production-market shadow tracking** over the next few days. The goal is to measure whether the algorithm's apparent demo/paper edges are actually executable in the real Kalshi market without placing production orders.
+Near-term objective: keep **production-market shadow tracking** running as a read-only data-collection and model-debugging loop. Current post-reset shadow evidence is negative, so the goal is no longer to validate an apparent edge; it is to diagnose forecast/model failures before any Phase 3/live-trading consideration.
 
 ## Current phase
-Phase 2.5 is implemented and running:
+Implemented phases:
 - Phase 1: read-only scanner.
 - Phase 2: local paper-trading ledger.
 - Phase 2.5: optional Kalshi demo execution backend, continuous runner, dashboard graphs, settlement reconciliation, and safety limits.
+- Phase 2.75: production-market shadow tracking.
 
-Current implementation now includes **Phase 2.75 production-market shadow tracking**.
+Current cloud mode is **Phase 2.75 shadow-only** on Railway/Supabase: production prices are read, shadow fills are simulated, and no demo/live orders are placed.
 
 ## 2026-06-02 cloud migration (now hosted on Railway + Supabase)
 The bot no longer runs self-hosted on Windows. It is deployed to the cloud:
@@ -29,6 +30,19 @@ The bot no longer runs self-hosted on Windows. It is deployed to the cloud:
 
 Full details, service IDs, and env vars: `docs/deployment.md`. The model-quality status and all
 trading caveats below are unchanged by the migration.
+
+## 2026-06-08 shadow performance update — still losing, now with clean negative evidence
+A live Supabase review of the post-reset production-shadow ledger (`observations.md`, generated 2026-06-08 00:51 UTC) found:
+- **83 total shadow fills:** 79 settled, 4 open; all are simulated/read-only production-shadow fills.
+- **Settled P/L: −469¢** on 2,169¢ cost basis (**−21.6% ROI**), **17/79 wins (21.5%)**.
+- Model calibration is poor: mean side-aware predicted win probability **69.3%** vs 21.5% empirical; Brier **0.386**, log loss **0.991**.
+- First clean/non-lookahead rows have settled: **7 fills, −172¢**, mean predicted win probability **90.7%**. The first go/no-go-quality sample is negative.
+- By series: `KXTEMPNYCH` −245¢ (forecast MAE 3.22°F vs 1°F strikes), `KXHIGHCHI` −177¢, `KXRAINNYC` −47¢.
+- Safety regressions remain fixed: no `event_ticker` has multiple shadow orders, and no filled order has side-aware `p_win < 0.55`.
+- New/remaining failure modes: adjacent-hour same-direction temp losses, overconfident probabilities, Open-Meteo/settlement-source bias, expensive BUY_NO payoff asymmetry, and band/rain model calibration errors.
+- Operational issue to monitor: one stale past-close shadow fill (`shadow_orders.id=79`, `KXTEMPNYCH-26JUN0521-T79.99`) remained unsettled during the report.
+
+Conclusion: **do not live trade**. Treat the bot as a shadow data collector/model debugging tool until bias correction, σ/band/rain recalibration, adjacent-hour risk caps, and skipped-trade counterfactual audits are implemented and re-tested.
 
 ## 2026-05-28 algorithm audit fixes (Findings 0–5)
 A code/data audit (see `~/.claude/plans/analyze-the-algorithm-and-golden-sutherland.md`) found and fixed:
@@ -109,7 +123,7 @@ All previous trades/results were archived before restarting evaluation with a cl
 
 The live `data/kalshi_weather.sqlite` was then cleared in place because another process held the DB file open. Current live counts were verified at zero for scans/signals/orders/snapshots/runner events. New calibration and win-rate analysis should use only post-reset rows unless explicitly comparing against the archive.
 
-## 2026-05-30 ACTIVE EXPERIMENT — relaxed shadow gate for data collection (auto-reverts 2026-06-06)
+## 2026-05-30 shadow-gate experiment — ended/reverted after 2026-06-06
 A from-the-data review found the post-reset bot is effectively idle on its core strategy: over ~24h, **94.7% of all production-shadow evaluations were skipped by the single `forecast_uncertainty_exceeds_strike_spacing` gate**, and **100% of both temperature series** (`KXTEMPNYCH` hourly, `KXHIGHCHI` daily high) were blocked. With `FORECAST_UNCERTAINTY_GATE_RATIO=1.0`, `DEFAULT_STRIKE_SPACING_F=1.0`, and the widened `_sigma` (≥4.5 F), the pass condition `sigma < 1.0` is unsatisfiable for every 1 F temperature ladder — so the gate is a categorical kill-switch, not a discriminating filter. Only rain markets trade (they bypass the gate via the `direct_probability` path). This is a **deadlock**: the stated near-term goal is to gather shadow data to recalibrate `_sigma`, but the gate prevents recording any settled temperature outcome.
 
 **Fix shipped (shadow-only, bounded, auto-reverting):**
@@ -118,7 +132,7 @@ A from-the-data review found the post-reset bot is effectively idle on its core 
 - The relaxed ratio applies **only while `date.today() <= 2026-06-06`**, then auto-reverts to the base `1.0`. A forgotten relaxed gate cannot persist.
 - **Not relaxed:** `MIN_TRADE_PROBABILITY=0.55`, the EV gate, `BEST_STRIKE_PER_EVENT`, `DISALLOW_MULTIPLE_POSITIONS_PER_EVENT`, `MAX_CONTRACTS_PER_EVENT=1`, cooldown. Even relaxed, only one best strike per event reaches shadow and it must still clear EV + 0.55 conviction, so the −74¢ correlated-ladder failure mode stays blocked.
 
-Design doc: `docs/superpowers/specs/2026-05-30-shadow-gate-experiment-design.md`. **On/after 2026-06-06** the gate reverts automatically; run `kalshi-weather-calib --source shadow` over the new settled temperature fills to recompute `_sigma`/Brier before deciding whether to keep, retune, or remove the gate. Do not treat fills collected during this relaxed window as evidence of edge — the relaxed gate exists to gather calibration data, not to prove profitability.
+Design doc: `docs/superpowers/specs/2026-05-30-shadow-gate-experiment-design.md`. **On/after 2026-06-06** the gate reverts automatically unless Railway env vars are deliberately extended. The 2026-06-08 review shows the collected fills were negative and poorly calibrated, including the first clean non-lookahead sample; do not extend relaxed temperature shadow trading as-is. Any future relaxation should be explicitly bounded, read-only, and labeled as calibration data, not edge evidence.
 
 ## Important conclusion from recent testing
 Kalshi demo is not the same as production. Demo fills/wins validate bot plumbing and can reveal bugs, but they are not proof of live profitability. Demo markets can be thin, stale, or quoted differently from real markets. Before live trading, we need several days of real production market-data shadow results.
@@ -291,12 +305,15 @@ Implemented before any live trading:
 7. Continuous runner can run it with `--production-shadow` at the recommended 15-minute cadence.
 
 ## Suggested next tasks
-The infrastructure tasks are done (shadow tables/mode, event caps, dashboard comparison, calibration). The open work is now **model quality**, because live shadow results are negative (see "2026-05-28 live shadow results" above):
-1. **Calibrate/widen `probability._sigma`** from realized forecast error (`kalshi-weather-calib` reads it). The current hourly-temp sigma is too tight and is the direct cause of the losses.
-2. **Forecast bias correction** per station/variable/hour using stored `forecast_value` vs `result_value`.
-3. **Gate out markets where forecast MAE ≥ strike spacing** (notably `KXTEMPNYCH` hourly) — the EV/edge test must account for forecast uncertainty, not just quote-vs-point-forecast.
-4. Keep collecting several more days of shadow data; re-score with `kalshi-weather-calib --source shadow`.
-5. (Lower priority) Export multi-day CSV/JSON; verify `result_value` extraction against settlement JSON.
+The infrastructure tasks are done (shadow tables/mode, event caps, dashboard comparison, calibration). The open work is now **model quality and risk controls**, because current post-reset production-shadow results are negative (see `observations.md` and the 2026-06-08 section above):
+1. **Implement forecast bias correction** per station/series, variable, and target hour using stored `forecast_value` vs `result_value`; a global offset is misleading because cold and warm regimes cancel.
+2. **Recalibrate/widen `probability._sigma`** from settled shadow errors, separately for hourly temp, daily high/low bands, and rain/no-rain behavior.
+3. **Add adjacent-hour / same-day directional caps** for hourly temperature events so one persistent forecast-bias regime cannot create repeated same-direction losses across consecutive hours.
+4. **Add an asymmetric-risk guard for expensive BUY_NO trades**, especially rain and one-degree bucket markets where one miss wipes out many small wins.
+5. **Keep conservative forecast-uncertainty gating by default.** Do not extend relaxed temperature shadow trading as-is; any future relaxation should be bounded and read-only for calibration only.
+6. **Backfill skipped high-EV outcomes** so "missed trades" can be evaluated by actual settlement/counterfactual P&L, not model EV alone.
+7. **Monitor/fix stale unsettled shadow orders** (e.g. `shadow_orders.id=79` from the 2026-06-08 report) and add dashboard alerting for past-close `SHADOW_FILLED` rows.
+8. (Lower priority) Export multi-day CSV/JSON; verify `result_value` extraction against settlement JSON.
 
 ## Caution for fresh agents
 Do not enable live trading. The project is still research/demo/shadow only, **and the current algorithm is empirically unprofitable on production-shadow data** — fix forecast quality/calibration first.

@@ -91,10 +91,12 @@ GitHub (lushkiwi/weather-bot, branch main)
 ### Operating notes
 
 - Pushing to `main` redeploys (Railway is connected to the GitHub repo).
-- **Shadow gate experiment** `SHADOW_GATE_EXPERIMENT_UNTIL` controls how long the relaxed shadow
-  gate (`SHADOW_FORECAST_UNCERTAINTY_GATE_RATIO=6.0`) records temperature markets. After that date
-  the conservative gate blocks ~all temperature ladders and shadow records little. Bump the Railway
-  var to keep collecting. Per `CLAUDE.md`, fills in this window are calibration data, not edge.
+- **Shadow gate experiment** `SHADOW_GATE_EXPERIMENT_UNTIL` controlled how long the relaxed shadow
+  gate (`SHADOW_FORECAST_UNCERTAINTY_GATE_RATIO=6.0`) recorded temperature markets. After that date
+  the conservative gate blocks ~all temperature ladders and shadow records little. The 2026-06-08
+  shadow review found the collected fills were negative and poorly calibrated, so do **not** bump the
+  Railway var to keep collecting as-is; any future extension should be an explicitly bounded,
+  read-only calibration experiment. Per `CLAUDE.md`, fills in this window are calibration data, not edge.
 - Local dev still works with no `DATABASE_URL` (SQLite) and `kalshi-weather-*` commands.
 
 A Vercel + Next.js dashboard remains a possible future upgrade, but the Python dashboard on Railway

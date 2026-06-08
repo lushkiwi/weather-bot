@@ -6,12 +6,13 @@ from typing import Any
 
 from .config import Settings
 from .fees import FeeModel
+from .forecast_adjustments import apply_forecast_adjustments
 from .kalshi_client import KalshiClient
 from .market_parser import parse_market
 from .models import WeatherVariable
 from .orderbook import parse_market_quote, parse_orderbook
 from .paper import TEMP_VARIABLES, TradeCandidate, _event_ticker, _is_lookahead
-from .probability import estimate_probability, forecast_resolves_strikes, strike_spacing
+from .probability import base_sigma, estimate_probability, forecast_resolves_strikes, strike_spacing
 from .safety import SafetyGuard
 from .stations import station_for_ticker
 from .storage import Store
@@ -155,8 +156,23 @@ class ProductionShadowTracker:
         yes_ask_size = depth["yes_ask_size"] or _float_or_zero(market.get("yes_ask_size_fp"))
         no_ask_size = depth["no_ask_size"] or _first_float(market.get("no_ask_size_fp"), market.get("yes_bid_size_fp"))
 
+        adjustment = apply_forecast_adjustments(
+            store=self.store,
+            settings=self.settings,
+            ticker=parsed.ticker,
+            variable=parsed.variable,
+            target_date=parsed.target_date,  # type: ignore[arg-type]
+            target_hour=parsed.target_hour,
+            raw_mean=forecast_value,
+            base_sigma=base_sigma(parsed.variable, parsed.target_date),  # type: ignore[arg-type]
+        )
+        source_bits = []
+        if adjustment.used_bias_correction:
+            source_bits.append(f"bias_corrected_n{adjustment.bias_samples}")
+        if adjustment.used_dynamic_sigma:
+            source_bits.append(f"dynamic_sigma_n{adjustment.sigma_samples}")
         estimate = estimate_probability(
-            mean=forecast_value,
+            mean=adjustment.adjusted_mean,
             threshold=parsed.threshold,  # type: ignore[arg-type]
             variable=parsed.variable,
             target_date=parsed.target_date,  # type: ignore[arg-type]
@@ -164,6 +180,8 @@ class ProductionShadowTracker:
             band_lower=parsed.band_lower,
             band_upper=parsed.band_upper,
             direct_probability=self._rain_probability(geo[0], geo[1], parsed),
+            sigma_override=adjustment.sigma,
+            source_suffix="+".join(source_bits) if source_bits else None,
         )
         fair_yes = estimate.probability_yes * 100.0
         fair_no = (1.0 - estimate.probability_yes) * 100.0
@@ -190,6 +208,8 @@ class ProductionShadowTracker:
             "city": geo[2],
             "target_date": parsed.target_date.isoformat() if parsed.target_date else None,
             "target_hour": parsed.target_hour,
+            "variable": parsed.variable.value,
+            "threshold": parsed.threshold,
             "band_lower": parsed.band_lower,
             "band_upper": parsed.band_upper,
             "event_ticker": _event_ticker(parsed.ticker),
@@ -197,7 +217,13 @@ class ProductionShadowTracker:
             "market_status": market.get("status"),
             "close_time": market.get("close_time"),
             "production_base_url": self.production_base_url,
-            "forecast_value": forecast_value,
+            "raw_forecast_value": adjustment.raw_mean,
+            "forecast_value": estimate.mean,
+            "forecast_sigma": estimate.sigma,
+            "model_source": estimate.source,
+            "bias_correction": adjustment.bias_correction,
+            "bias_correction_n": adjustment.bias_samples,
+            "bias_mae": adjustment.bias_mae,
             "probability_yes": estimate.probability_yes,
             "fair_yes_cents": fair_yes,
             "fair_no_cents": fair_no,
@@ -258,6 +284,12 @@ class ProductionShadowTracker:
                 default_min_ev_cents=self.settings.min_edge_cents * self.quantity,
                 event_ticker=ev.event_ticker,
                 probability_win=selected.probability_win,
+                series_ticker=parsed.ticker.split("-", 1)[0],
+                target_date=parsed.target_date,
+                target_hour=parsed.target_hour,
+                variable=parsed.variable,
+                band_lower=parsed.band_lower,
+                band_upper=parsed.band_upper,
             )
             if not safety.allowed:
                 skipped = f"production_{safety.reason}"
@@ -372,6 +404,12 @@ class _ShadowSafetyView:
 
     def event_open_exposure_cents(self, event_ticker: str) -> float:
         return self.store.shadow_event_open_exposure_cents(event_ticker)
+
+    def same_day_directional_order_quantity(self, series_ticker: str, target_date: str, side: str) -> int:
+        return self.store.shadow_same_day_directional_order_quantity(series_ticker, target_date, side)
+
+    def adjacent_hour_directional_order_quantity(self, series_ticker: str, target_date: str, target_hour: int, side: str, window: int) -> int:
+        return self.store.shadow_adjacent_hour_directional_order_quantity(series_ticker, target_date, target_hour, side, window)
 
 
 def _market_is_tradeable(market: dict) -> bool:

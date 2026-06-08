@@ -43,6 +43,7 @@ class CalibrationReport:
     reliability: list[dict] = field(default_factory=list)
     forecast_mae: float | None = None
     forecast_bias: float | None = None
+    forecast_rmse: float | None = None
     excluded_lookahead: int = 0
 
 
@@ -103,6 +104,7 @@ def compute_calibration(store: Store, source: str = "paper", include_lookahead: 
     if errors:
         report.forecast_mae = sum(abs(e) for e in errors) / len(errors)
         report.forecast_bias = sum(errors) / len(errors)
+        report.forecast_rmse = math.sqrt(sum(e * e for e in errors) / len(errors))
 
     return report
 
@@ -116,7 +118,7 @@ def format_report(report: CalibrationReport) -> str:
     lines.append(f"brier={report.brier:.4f}  log_loss={report.log_loss:.4f}  (lower is better; 0.25 = coin flip)")
     lines.append(f"mean_predicted={report.mean_predicted:.3f}  empirical_win_rate={report.win_rate:.3f}  realized_pnl_cents={report.total_pnl_cents:.0f}")
     if report.forecast_mae is not None:
-        lines.append(f"forecast_MAE={report.forecast_mae:.2f}  forecast_bias={report.forecast_bias:+.2f} (forecast - realized)")
+        lines.append(f"forecast_MAE={report.forecast_mae:.2f}  forecast_RMSE={report.forecast_rmse:.2f}  forecast_bias={report.forecast_bias:+.2f} (forecast - realized)")
     lines.append("reliability (predicted -> empirical):")
     for b in report.reliability:
         lines.append(f"  {b['bin']}: n={b['count']:>4}  predicted={b['mean_predicted']:.3f}  empirical={b['empirical']:.3f}")

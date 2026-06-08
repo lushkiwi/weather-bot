@@ -181,6 +181,7 @@ HTML = r"""<!doctype html>
     <div id="open" class="page">
       <div class="grid">
         <section class="panel wide"><h2>Current open shadow bids</h2><div class="hint">These are simulated fills still waiting for settlement.</div><div id="openShadow"></div></section>
+        <section class="panel wide"><h2>Stale past-close shadow fills</h2><div class="hint">Unsettled simulated fills whose close time is more than 6 hours in the past.</div><div id="staleShadow"></div></section>
         <section class="panel wide"><h2>Open local paper positions</h2><div id="positions"></div></section>
         <section class="panel wide"><h2>Recent production quote snapshots</h2><div id="shadowSnapshots"></div></section>
       </div>
@@ -303,6 +304,7 @@ function render(data) {
   $('sideChart').innerHTML = barChart(data.side_mix, 'selected_side', 'count');
   $('shadowSideChart').innerHTML = barChart(data.shadow_side_mix, 'selected_side', 'count');
   $('openShadow').innerHTML = orderTable(data.open_shadow_orders, 'No open shadow fills.');
+  $('staleShadow').innerHTML = orderTable(data.stale_shadow_orders, 'No stale past-close shadow fills.');
   $('settledShadow').innerHTML = orderTable(data.settled_shadow_orders, 'No settled shadow fills yet.');
   $('positions').innerHTML = table(data.positions, [{label:'Ticker', render:r=>`<span class="ticker">${r.ticker}</span>`}, {label:'Side', key:'side'}, {label:'Qty', key:'quantity', num:true}, {label:'Avg', render:r=>cents(r.avg_price_cents), num:true}, {label:'Fees', render:r=>cents(r.total_fees_cents), num:true}], 'No open paper positions.');
   $('shadowSnapshots').innerHTML = snapshotTable(data.shadow_snapshots);
@@ -319,13 +321,13 @@ function calibrationHtml(c) {
   if (!c) return '<div class="hint">No calibration data yet.</div>';
   function block(name, r) {
     if (!r || !r.n) return `<div class="metric"><b>—</b><span>${name}: no settled outcomes</span></div>`;
-    const fc = (r.forecast_mae != null) ? ` <div class="metric"><b>${r.forecast_mae.toFixed(2)}°</b><span>${name} forecast MAE (bias ${r.forecast_bias>=0?'+':''}${r.forecast_bias.toFixed(2)})</span></div>` : '';
+    const fc = (r.forecast_mae != null) ? ` <div class="metric"><b>${r.forecast_mae.toFixed(2)}°</b><span>${name} MAE / RMSE ${r.forecast_rmse != null ? r.forecast_rmse.toFixed(2) : '—'} (bias ${r.forecast_bias>=0?'+':''}${r.forecast_bias.toFixed(2)})</span></div>` : '';
     return `<div class="metric"><b>${r.brier.toFixed(3)}</b><span>${name} Brier (0.25=coin)</span></div>`
       + `<div class="metric"><b>${(r.mean_predicted*100).toFixed(0)}% / ${(r.win_rate*100).toFixed(0)}%</b><span>${name} predicted / actual</span></div>`
-      + `<div class="metric"><b>${r.n_events}</b><span>${name} independent events (n=${r.n})</span></div>`
+      + `<div class="metric"><b>${signedCents(r.total_pnl_cents)}</b><span>${name} realized P/L; events=${r.n_events}, n=${r.n}, excluded=${r.excluded_lookahead || 0}</span></div>`
       + fc;
   }
-  return `<div class="metrics">${block('Paper', c.paper)}${block('Shadow', c.shadow)}</div>`;
+  return `<div class="metric-strip">${block('Paper clean', c.paper_clean)}${block('Paper all', c.paper_all)}${block('Shadow clean', c.shadow_clean)}${block('Shadow all', c.shadow_all)}</div>`;
 }
 function orderTable(rows, empty) {
   return table(rows, [{label:'Ticker', render:r=>`<span class="ticker">${r.ticker}</span>`}, {label:'Side', key:'side'}, {label:'Qty', key:'quantity', num:true}, {label:'Fill', render:r=>cents(r.avg_fill_price_cents), num:true}, {label:'Fee', render:r=>cents(r.fee_cents), num:true}, {label:'Result', key:'settlement_result'}, {label:'P/L', render:r=>`<span class="${clsPnL(r.realized_pnl_cents)}">${signedCents(r.realized_pnl_cents)}</span>`, num:true}, {label:'Status', key:'status'}, {label:'Time', key:'created_at'}], empty);
@@ -432,6 +434,7 @@ def load_summary(db_path: str) -> dict:
     # creating a stray file. (Postgres always connects.)
     if not _is_postgres_target(db_path) and not Path(db_path).exists():
         return _empty_summary()
+    settings = Settings()
     store = Store(db_path)
     conn = store.conn
     # Hour-bucket label expression differs by backend (SQLite strftime vs Postgres to_char).
@@ -518,6 +521,7 @@ def load_summary(db_path: str) -> dict:
             "demo_orders": rows(conn, "SELECT * FROM demo_orders ORDER BY id DESC LIMIT 40"),
             "positions": rows(conn, "SELECT ticker, side, SUM(quantity) AS quantity, AVG(avg_fill_price_cents) AS avg_price_cents, SUM(COALESCE(fee_cents,0)) AS total_fees_cents, MAX(created_at) AS updated_at FROM paper_orders WHERE status = 'FILLED' AND realized_pnl_cents IS NULL GROUP BY ticker, side ORDER BY updated_at DESC LIMIT 80"),
             "open_shadow_orders": rows(conn, "SELECT * FROM shadow_orders WHERE status = 'SHADOW_FILLED' AND realized_pnl_cents IS NULL ORDER BY id DESC LIMIT 80"),
+            "stale_shadow_orders": store.stale_shadow_orders(hours_after_close=settings.stale_unsettled_grace_hours, limit=80),
             "settled_shadow_orders": rows(conn, "SELECT * FROM shadow_orders WHERE realized_pnl_cents IS NOT NULL ORDER BY COALESCE(settled_at, created_at) DESC LIMIT 80"),
             "shadow_snapshots": rows(conn, "SELECT * FROM shadow_snapshots ORDER BY id DESC LIMIT 80"),
             "runner_events": rows(conn, "SELECT * FROM runner_events ORDER BY id DESC LIMIT 80"),
@@ -551,19 +555,24 @@ def load_summary(db_path: str) -> dict:
 
 
 def _calibration_summary(store: Store) -> dict:
-    """Headline calibration metrics for the dashboard (leakage-flagged rows excluded)."""
+    """Headline calibration metrics for the dashboard, split clean vs all rows."""
     out = {}
     for source in ("paper", "shadow"):
-        r = compute_calibration(store, source=source, include_lookahead=False)
-        out[source] = {
-            "n": r.n,
-            "n_events": r.n_events,
-            "brier": r.brier,
-            "mean_predicted": r.mean_predicted,
-            "win_rate": r.win_rate,
-            "forecast_mae": r.forecast_mae,
-            "forecast_bias": r.forecast_bias,
-        }
+        for include, label in ((False, "clean"), (True, "all")):
+            r = compute_calibration(store, source=source, include_lookahead=include)
+            out[f"{source}_{label}"] = {
+                "n": r.n,
+                "n_events": r.n_events,
+                "brier": r.brier,
+                "mean_predicted": r.mean_predicted,
+                "win_rate": r.win_rate,
+                "forecast_mae": r.forecast_mae,
+                "forecast_bias": r.forecast_bias,
+                "forecast_rmse": r.forecast_rmse,
+                "log_loss": r.log_loss,
+                "total_pnl_cents": r.total_pnl_cents,
+                "excluded_lookahead": r.excluded_lookahead,
+            }
     return out
 
 
@@ -581,9 +590,9 @@ def _empty_summary() -> dict:
         "latest_scan": None,
         "scan_runs": [], "scan_series": [], "skip_reasons": [], "shadow_skip_reasons": [], "shadow_fillability": [],
         "side_mix": [], "shadow_side_mix": [], "recent_signals": [], "demo_orders": [], "positions": [], "open_shadow_orders": [],
-        "settled_shadow_orders": [], "shadow_snapshots": [], "runner_events": [], "pnl_by_side": [], "shadow_pnl_by_side": [],
+        "settled_shadow_orders": [], "stale_shadow_orders": [], "shadow_snapshots": [], "runner_events": [], "pnl_by_side": [], "shadow_pnl_by_side": [],
         "shadow_pnl_series": [], "shadow_comparison": [],
-        "calibration": {"paper": {}, "shadow": {}},
+        "calibration": {"paper_clean": {}, "paper_all": {}, "shadow_clean": {}, "shadow_all": {}},
     }
 
 

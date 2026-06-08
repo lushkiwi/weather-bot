@@ -6,10 +6,12 @@
 
 > **Infra (2026-06-02): now cloud-hosted.** Migrated off self-hosted Windows to **Railway** (cron `runner` every 10 min + always-on `dashboard`) backed by **Supabase Postgres**, code on GitHub. The cron runs `--shadow-only` (read-only production shadow; no demo orders, **no live trading** — Phase 3 below is still gated). `Store` is dual-backend (Postgres via `DATABASE_URL`, else local SQLite). See `docs/deployment.md` and `PROJECT_STATUS.md`.
 
+> **Status (2026-06-08): current post-reset shadow results are negative.** Supabase shadow ledger review: 83 shadow fills, 79 settled, **17/79 wins**, **−469¢** realized P/L on 2,169¢ cost basis; first clean non-lookahead sample is **7 fills, −172¢**. Calibration is poor (mean predicted p_win 69.3% vs 21.5% empirical, Brier 0.386). The bot remains a read-only data collector/model-debugging tool; do not live trade.
+
 ## Goal
 Build a weather-market edge scanner and trading system for Kalshi. Phase 1 is read-only: discover open weather markets, estimate fair probabilities from external weather forecasts, compare against Kalshi orderbook prices, and rank potential edges. No orders are placed in Phase 1.
 
-Current near-term goal: keep the demo bot/dashboard running while collecting **production-market shadow tracking** data. Demo fills are useful for validating execution plumbing, but demo liquidity/prices are not the same as live Kalshi markets. Before any live trading, the bot should record real production orderbooks and evaluate whether the algorithm would have found executable edges in the real market over several days.
+Current near-term goal: keep the dashboard and **production-market shadow tracking** running as read-only model-debugging infrastructure. Demo fills are useful only for validating execution plumbing; production-shadow results are the real go/no-go signal, and current post-reset results are negative.
 
 ## Strategy Recommendation
 Use a hybrid system:
@@ -112,7 +114,7 @@ Kalshi demo is not a reliable proxy for live profitability. Demo markets can be 
 - [x] Preserve strict no-live-trading default.
 
 ### Empirical finding (the current blocker)
-Shadow data shows **no edge** on the most-traded markets (`KXTEMPNYCH` hourly): the forecast MAE (~2°F) is ≥ the strike spacing, so the model is trading noise into a spread, and the tight `sigma` amplifies it into real losses. This must be fixed before continuing — see Phase 4, which is now the active phase, not a future one.
+Shadow data shows **no edge** on the most-traded markets. As of 2026-06-08, post-reset production-shadow is **−469¢** over 79 settled fills, with only 21.5% wins despite 69.3% mean predicted win probability. The first clean/non-lookahead rows are also negative (**−172¢** over 7 fills). For `KXTEMPNYCH` hourly, forecast MAE is about 3.2°F versus 1°F strike spacing; the bot repeatedly trades the Open-Meteo/settlement-source bias into the spread. This must be fixed before continuing — see Phase 4, which is now the active phase, not a future one.
 
 ### Cadence recommendation
 - Start with 15-minute scans for broad production shadow tracking.
@@ -124,7 +126,7 @@ Shadow data shows **no edge** on the most-traded markets (`KXTEMPNYCH` hourly): 
 ### Preconditions
 - Several days of production-market shadow tracking.
 - **Calibrated probabilities** (`kalshi-weather-calib` showing Brier well below 0.25 and reliability close to the diagonal) — currently FAILING.
-- **Positive, fee-aware shadow P/L on non-leakage fills** — currently NEGATIVE (-74¢ over first 18).
+- **Positive, fee-aware shadow P/L on non-leakage fills** — currently NEGATIVE (2026-06-08: all settled shadow −469¢; clean/non-lookahead −172¢ over 7 fills).
 - Evidence that edges are executable in production, not just demo.
 - Event-level exposure limits for correlated temperature ladders (done).
 - Manual approval reviewed and tested.
@@ -141,11 +143,13 @@ Shadow data shows **no edge** on the most-traded markets (`KXTEMPNYCH` hourly): 
 ## Phase 4 — Better forecasting model (NOW THE ACTIVE PHASE)
 
 The shadow results promoted this from "future" to "blocking." Concrete near-term tasks, in order:
-1. ✅ **Done (2026-05-28): calibrate/widen `probability._sigma`** from realized forecast error (lead-0 point-temp 2.5→4.5°F, high/low 3→5°F). Re-tune from `kalshi-weather-calib` as more data settles.
-2. **Forecast bias correction** per station/variable/hour using the stored `forecast_value` vs `result_value` history (extend `stations.py` + a rolling-error table). **(still open)**
-3. ✅ **Done (2026-05-28): edge gate that accounts for forecast uncertainty** — `FORECAST_UNCERTAINTY_GATE_RATIO` skips markets where `sigma ≥ ratio × strike_spacing` (`probability.forecast_resolves_strikes`).
-4. ✅ **Done (2026-05-28): correlated-ladder fix** — `BEST_STRIKE_PER_EVENT` places only the single best-EV strike per event per scan (this was the dominant loss driver, ahead of sigma).
-5. ✅ **Done (2026-05-29): across-scan event lockout + probability floor** — repeated scans can no longer add more strikes to an already-traded event (`DISALLOW_MULTIPLE_POSITIONS_PER_EVENT=true`, `MAX_CONTRACTS_PER_EVENT=1`), and low-probability tail bets are skipped by `MIN_TRADE_PROBABILITY=0.55`.
+1. **Forecast bias correction** per station/series, variable, and target hour using the stored `forecast_value` vs `result_value` history (extend `stations.py` + a rolling-error table). This is still open and now the highest-value fix; global bias is misleading because cold overnight and warm afternoon/evening regimes cancel.
+2. **Recalibrate/widen `probability._sigma` again** from settled shadow errors, separately for hourly temp, daily high/low band buckets, and rain/no-rain. The 2026-05-28 widening was necessary but current Brier/log-loss show it is not sufficient.
+3. **Add adjacent-hour / same-day directional caps** for hourly temperature markets. Existing event lockout stops multiple strikes in one hour, but not repeated same-direction losses across consecutive hours in the same forecast-bias regime.
+4. **Add expensive-BUY_NO/asymmetric-payoff controls** for rain and bucket markets; one miss at 60–95¢ wipes out many small NO wins.
+5. **Backfill skipped high-EV outcomes** so missed trades can be evaluated by actual settlement/counterfactual P&L rather than model EV.
+6. ✅ **Done (2026-05-28): edge gate that accounts for forecast uncertainty** — `FORECAST_UNCERTAINTY_GATE_RATIO` skips markets where `sigma ≥ ratio × strike_spacing` (`probability.forecast_resolves_strikes`). Keep the conservative gate by default; do not extend relaxed shadow trading as-is.
+7. ✅ **Done (2026-05-28/29): correlated-ladder fix + across-scan event lockout + probability floor** — `BEST_STRIKE_PER_EVENT`, `DISALLOW_MULTIPLE_POSITIONS_PER_EVENT=true`, `MAX_CONTRACTS_PER_EVENT=1`, and `MIN_TRADE_PROBABILITY=0.55` are working, but they do not prove edge.
 
 ### Later deliverables
 - Station/city mapping improvements (`stations.py` started).
@@ -177,4 +181,4 @@ The initial implementation is intentionally conservative:
 2. Inspect `README.md` and `src/kalshi_weather_bot/`.
 3. Confirm Phase 1 scanner runs with valid Kalshi credentials.
 4. For Phase 2, add persistence under `data/` and implement paper-fill simulation.
-5. Do not enable live trading until Phase 3 risk controls exist and have been reviewed.
+5. Do not enable live trading until Phase 3 risk controls exist, model calibration is positive on clean production-shadow data, and the current negative findings in `observations.md` have been resolved.
