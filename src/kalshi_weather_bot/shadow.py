@@ -240,7 +240,7 @@ class ProductionShadowTracker:
             "fee_cents": selected.fee_cents,
             "fee_adjusted_ev_cents": selected.ev_cents,
             "skipped_reason": None,
-            "orderbook_json": orderbook_payload,
+            "orderbook_json": orderbook_payload if self.settings.persist_shadow_orderbook_json else None,
         }
         return _ShadowEvaluation(snapshot=snapshot, parsed=parsed, event_ticker=_event_ticker(parsed.ticker), selected=selected, stateless_skip=stateless_skip)
 

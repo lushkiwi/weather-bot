@@ -80,6 +80,9 @@ class Settings(BaseSettings):
     dynamic_sigma_include_lookahead: bool = Field(default=False, alias="DYNAMIC_SIGMA_INCLUDE_LOOKAHEAD")
 
     stale_unsettled_grace_hours: int = Field(default=6, alias="STALE_UNSETTLED_GRACE_HOURS")
+    # Raw orderbook JSON is bulky and not used by the dashboard/model. Keep it off by default on
+    # the free Supabase tier; enable only for short debugging windows.
+    persist_shadow_orderbook_json: bool = Field(default=False, alias="PERSIST_SHADOW_ORDERBOOK_JSON")
 
     # --- Bounded shadow-only data-collection experiment (added 2026-05-30) ---
     # The conservative gate above (ratio 1.0 vs ~1 F strike spacing) is unsatisfiable for every
