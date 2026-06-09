@@ -7,6 +7,7 @@ from datetime import datetime
 from dotenv import load_dotenv
 
 from .config import Settings
+from .counterfactual import production_client, run_backfill
 from .demo_execution import DemoExecutor
 from .fees import FeeModel
 from .kalshi_client import KalshiClient
@@ -15,6 +16,30 @@ from .pnl import reconcile_paper_settlements
 from .safety import SafetyGuard
 from .shadow import ProductionShadowTracker
 from .storage import Store
+
+
+def _counterfactual_backfill_msg(settings: Settings, store: Store) -> str:
+    """Run the read-only counterfactual settlement backfill and format the runner-event fragment.
+
+    Errors are reported in the fragment rather than raised: a flaky upstream must not fail the
+    scan iteration that just completed.
+    """
+    if not settings.counterfactual_backfill_enabled:
+        return ""
+    try:
+        stats = run_backfill(
+            store,
+            production_client(settings),
+            source="shadow",
+            min_ev_cents=settings.counterfactual_min_ev_cents,
+            limit=settings.counterfactual_max_fetches_per_run,
+        )
+    except Exception as exc:  # noqa: BLE001
+        return f" cf_error={type(exc).__name__}"
+    return (
+        f" cf_candidates={stats['candidates']} cf_wrote={stats['written']} "
+        f"cf_resolved={stats['resolved']} cf_errors={stats['errors']}"
+    )
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -75,13 +100,14 @@ def main(argv: list[str] | None = None) -> int:
                 stale_shadow = store.stale_shadow_orders(settings.stale_unsettled_grace_hours, limit=5)
                 if stale_shadow:
                     store.insert_runner_event("warning", f"stale_shadow_orders count={len(stale_shadow)} oldest_id={stale_shadow[0].get('id')}")
+                cf_msg = _counterfactual_backfill_msg(settings, store)
                 msg = (
                     f"shadow_only scan_id={shadow_result.scan_id} shadow_markets={shadow_result.markets_seen} "
                     f"shadow_snapshots={shadow_result.snapshots_recorded} shadow_fills={shadow_result.shadow_orders_filled} "
                     f"shadow_no_liq={shadow_result.skipped_no_liquidity} shadow_no_edge={shadow_result.skipped_no_edge} "
                     f"shadow_market_errors={shadow_result.market_errors} "
                     f"shadow_pnl_checked={shadow_pnl.markets_checked} shadow_pnl_settled={shadow_pnl.orders_settled} "
-                    f"stale_shadow_orders={len(stale_shadow)}"
+                    f"stale_shadow_orders={len(stale_shadow)}{cf_msg}"
                 )
             else:
                 trader = PaperTrader(
@@ -102,13 +128,14 @@ def main(argv: list[str] | None = None) -> int:
                     stale_shadow = store.stale_shadow_orders(settings.stale_unsettled_grace_hours, limit=5)
                     if stale_shadow:
                         store.insert_runner_event("warning", f"stale_shadow_orders count={len(stale_shadow)} oldest_id={stale_shadow[0].get('id')}")
+                    cf_msg = _counterfactual_backfill_msg(settings, store)
                     shadow_msg = (
                         f" shadow_scan_id={shadow_result.scan_id} shadow_markets={shadow_result.markets_seen} "
                         f"shadow_snapshots={shadow_result.snapshots_recorded} shadow_fills={shadow_result.shadow_orders_filled} "
                         f"shadow_no_liq={shadow_result.skipped_no_liquidity} shadow_no_edge={shadow_result.skipped_no_edge} "
                         f"shadow_market_errors={shadow_result.market_errors} "
                         f"shadow_pnl_checked={shadow_pnl.markets_checked} shadow_pnl_settled={shadow_pnl.orders_settled} "
-                        f"stale_shadow_orders={len(stale_shadow)}"
+                        f"stale_shadow_orders={len(stale_shadow)}{cf_msg}"
                     )
                 msg = (
                     f"scan_id={result.scan_id} markets={result.markets_seen} signals={result.signals_recorded} "

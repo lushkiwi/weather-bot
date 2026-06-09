@@ -193,6 +193,8 @@ HTML = r"""<!doctype html>
         <section class="panel"><h2>Shadow P/L by side</h2><div id="shadowPnlBySide"></div></section>
         <section class="panel"><h2>Paper P/L by side</h2><div id="pnlBySide"></div></section>
         <section class="panel wide"><h2>Model calibration</h2><div class="hint">Are the model's probabilities trustworthy? Predicted should match actual; lower Brier is better. Same-day (leakage) rows excluded.</div><div id="calibration"></div></section>
+        <section class="panel wide"><h2>Skipped-trade counterfactuals</h2><div class="hint">What skipped candidates would have earned if traded. Model-EV misses are not proven misses; this is the settlement-based answer.</div><div id="counterfactuals"></div></section>
+        <section class="panel wide"><h2>Verified forecast error on skipped markets</h2><div class="hint">Forecast vs settlement value for markets the gates refused to trade. This is the data that feeds bias correction / dynamic sigma; compare MAE against the series strike spacing (1°F for hourly temp).</div><div id="counterfactualForecast"></div></section>
       </div>
     </div>
 
@@ -311,6 +313,8 @@ function render(data) {
   $('shadowPnlBySide').innerHTML = table(data.shadow_pnl_by_side, [{label:'Side', key:'side'}, {label:'Orders', key:'orders', num:true}, {label:'Wins', key:'wins', num:true}, {label:'P/L', render:r=>`<span class="${clsPnL(r.realized_pnl_cents)}">${signedCents(r.realized_pnl_cents)}</span>`, num:true}], 'No settled shadow orders.');
   $('pnlBySide').innerHTML = table(data.pnl_by_side, [{label:'Side', key:'side'}, {label:'Orders', key:'orders', num:true}, {label:'Wins', key:'wins', num:true}, {label:'P/L', render:r=>signedCents(r.realized_pnl_cents), num:true}], 'No settled paper orders.');
   $('calibration').innerHTML = calibrationHtml(data.calibration);
+  $('counterfactuals').innerHTML = table(data.counterfactual, [{label:'Skip reason', render:r=>`<span class="pill">${r.skipped_reason || '—'}</span>`}, {label:'N', key:'n', num:true}, {label:'Would-be wins', key:'wins', num:true}, {label:'Counterfactual P/L', render:r=>`<span class="${clsPnL(r.pnl_cents)}">${signedCents(r.pnl_cents)}</span>`, num:true}, {label:'Avg model EV', render:r=>cents(r.avg_model_ev_cents), num:true}], 'No settled counterfactual outcomes yet.');
+  $('counterfactualForecast').innerHTML = table(data.counterfactual_forecast, [{label:'Series', render:r=>`<span class="ticker">${r.series}</span>`}, {label:'Verified N', key:'n', num:true}, {label:'Bias °F', render:r=>(r.bias_f>=0?'+':'')+Number(r.bias_f).toFixed(2), num:true}, {label:'MAE °F', render:r=>Number(r.mae_f).toFixed(2), num:true}], 'No verified skipped-market forecasts yet.');
   $('shadowCompare').innerHTML = table(data.shadow_comparison, [{label:'Ticker', render:r=>`<span class="ticker">${r.ticker}</span>`}, {label:'Local side', key:'local_side'}, {label:'Prod side', key:'production_side'}, {label:'Local', render:r=>cents(r.local_price_cents), num:true}, {label:'Prod', render:r=>cents(r.production_price_cents), num:true}, {label:'Diff', render:r=>signedCents(r.price_diff_cents), num:true}, {label:'Prod size', key:'production_size', num:true}, {label:'Fillable', render:r=>r.production_fillable ? '<span class="good">yes</span>' : '<span class="bad">no</span>'}, {label:'Prod skip', key:'production_skip'}], 'No overlapping local and production tickers yet.');
   $('signals').innerHTML = table(data.recent_signals, [{label:'Ticker', render:r=>`<span class="ticker">${r.ticker}</span>`}, {label:'Side', key:'selected_side'}, {label:'City', key:'city'}, {label:'P(YES)', render:r=>pct(r.probability_yes), num:true}, {label:'YES ask', render:r=>cents(r.yes_ask_cents), num:true}, {label:'NO ask', render:r=>cents(r.no_ask_cents), num:true}, {label:'Selected', render:r=>cents(r.selected_price_cents), num:true}, {label:'EV', render:r=>cents(r.fee_adjusted_ev_cents), num:true}, {label:'Skip', key:'skipped_reason'}]);
   $('demoOrders').innerHTML = table(data.demo_orders, [{label:'Ticker', render:r=>`<span class="ticker">${r.ticker}</span>`}, {label:'Side', key:'side'}, {label:'Client order', key:'client_order_id'}, {label:'Price', key:'price_dollars', num:true}, {label:'Qty', key:'quantity', num:true}, {label:'Status', key:'status'}, {label:'Error', key:'error'}], 'No demo orders.');
@@ -549,6 +553,8 @@ def load_summary(db_path: str) -> dict:
                 LIMIT 80
             """),
             "calibration": _calibration_summary(store),
+            "counterfactual": store.counterfactual_summary("shadow"),
+            "counterfactual_forecast": store.counterfactual_forecast_summary("shadow"),
         }
     finally:
         conn.close()
@@ -593,6 +599,7 @@ def _empty_summary() -> dict:
         "settled_shadow_orders": [], "stale_shadow_orders": [], "shadow_snapshots": [], "runner_events": [], "pnl_by_side": [], "shadow_pnl_by_side": [],
         "shadow_pnl_series": [], "shadow_comparison": [],
         "calibration": {"paper_clean": {}, "paper_all": {}, "shadow_clean": {}, "shadow_all": {}},
+        "counterfactual": [], "counterfactual_forecast": [],
     }
 
 

@@ -377,8 +377,12 @@ class PaperTrader:
             return None
 
     def _usable(self, parsed) -> bool:
+        # A known settlement station is as good a location as a parsed city name: many series
+        # (e.g. KXHIGHNY) carry no city in the title, and requiring one silently dropped every
+        # market in those series before a signal was recorded.
+        has_location = bool(parsed.city) or station_for_ticker(parsed.ticker) is not None
         return bool(
-            parsed.city
+            has_location
             and parsed.target_date
             and parsed.threshold is not None
             and parsed.variable != WeatherVariable.UNKNOWN

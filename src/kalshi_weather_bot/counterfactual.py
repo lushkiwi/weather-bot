@@ -18,6 +18,57 @@ def _production_settings(settings: Settings) -> Settings:
     return settings.model_copy(update=overrides)
 
 
+def production_client(settings: Settings) -> KalshiClient:
+    """Read-only client against the production/external API using the shadow credentials."""
+    client_settings = _production_settings(settings)
+    client_settings.require_kalshi_auth()
+    return KalshiClient(client_settings)
+
+
+def run_backfill(
+    store: Store,
+    client: KalshiClient,
+    *,
+    source: str = "shadow",
+    min_ev_cents: float = 10.0,
+    limit: int = 50,
+    skip_reason: str | None = None,
+) -> dict[str, int]:
+    """Fetch settlement outcomes for skipped rows whose markets have closed.
+
+    Read-only: one ``get_market`` call per candidate ticker. Per-ticker errors are isolated so one
+    bad/missing market does not abort the run; unresolved tickers are retried on later runs.
+    """
+    candidates = store.counterfactual_candidates(
+        source=source,
+        min_ev_cents=min_ev_cents,
+        limit=limit,
+        skip_reason=skip_reason,
+    )
+    written = resolved = errors = 0
+    for row in candidates:
+        try:
+            market = client.get_market(str(row["ticker"]))
+        except Exception:  # noqa: BLE001 - upstream 404/5xx for one ticker must not kill the loop
+            errors += 1
+            continue
+        store.upsert_counterfactual_outcome(
+            source=source,
+            source_row_id=int(row["source_row_id"]),
+            ticker=str(row["ticker"]),
+            selected_side=row.get("selected_side"),
+            selected_price_cents=row.get("selected_price_cents"),
+            fee_cents=row.get("fee_cents"),
+            fee_adjusted_ev_cents=row.get("fee_adjusted_ev_cents"),
+            skipped_reason=row.get("skipped_reason"),
+            market=market,
+        )
+        written += 1
+        if str(market.get("result") or market.get("expiration_value") or "").strip():
+            resolved += 1
+    return {"candidates": len(candidates), "written": written, "resolved": resolved, "errors": errors}
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Backfill skipped high-EV outcomes and compute counterfactual P/L")
     parser.add_argument("--db", default="data/kalshi_weather.sqlite")
@@ -47,25 +98,20 @@ def main(argv: list[str] | None = None) -> int:
     if args.dry_run:
         return 0
 
-    client_settings = _production_settings(settings) if args.source == "shadow" else settings
-    client_settings.require_kalshi_auth()
-    client = KalshiClient(client_settings)
-    written = 0
-    for row in candidates:
-        market = client.get_market(str(row["ticker"]))
-        store.upsert_counterfactual_outcome(
-            source=args.source,
-            source_row_id=int(row["source_row_id"]),
-            ticker=str(row["ticker"]),
-            selected_side=row.get("selected_side"),
-            selected_price_cents=row.get("selected_price_cents"),
-            fee_cents=row.get("fee_cents"),
-            fee_adjusted_ev_cents=row.get("fee_adjusted_ev_cents"),
-            skipped_reason=row.get("skipped_reason"),
-            market=market,
-        )
-        written += 1
-    print(f"wrote={written}")
+    if args.source == "shadow":
+        client = production_client(settings)
+    else:
+        settings.require_kalshi_auth()
+        client = KalshiClient(settings)
+    stats = run_backfill(
+        store,
+        client,
+        source=args.source,
+        min_ev_cents=args.min_ev_cents,
+        limit=args.limit,
+        skip_reason=args.skip_reason,
+    )
+    print(f"wrote={stats['written']} resolved={stats['resolved']} errors={stats['errors']}")
     for summary in store.counterfactual_summary(args.source):
         print(summary)
     return 0

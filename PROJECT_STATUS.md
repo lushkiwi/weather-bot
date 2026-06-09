@@ -31,6 +31,56 @@ The bot no longer runs self-hosted on Windows. It is deployed to the cloud:
 Full details, service IDs, and env vars: `docs/deployment.md`. The model-quality status and all
 trading caveats below are unchanged by the migration.
 
+## 2026-06-09 — second ledger reset, model-revamp documentation, and the counterfactual calibration loop
+
+**The 2026-06-08 revamp (commits `697e0b2`, `a911f11`) was shipped but never documented; recorded here.**
+It added: per-station/variable/hour **forecast bias correction** (`forecast_adjustments.py`,
+`ENABLE_FORECAST_BIAS_CORRECTION=true`, lookback 45d, clip ±6°F), **dynamic sigma** (widen-only from
+realized residual RMSE, `ENABLE_DYNAMIC_SIGMA=true`), **adjacent-hour/same-day directional caps**
+(`MAX_ADJACENT_HOUR_DIRECTIONAL_ORDERS=1` in a ±3h window, `MAX_SAME_DAY_DIRECTIONAL_ORDERS=2`,
+hourly temp only), **expensive/asymmetric BUY_NO guards** (`MAX_RAIN_NO_ASK_CENTS=65`,
+`MAX_BAND_NO_ASK_CENTS=65`, `MAX_ASYMMETRIC_NO_ASK_CENTS=90`, NO ≥60¢ requires ≥15¢ EV), a
+stale-unsettled shadow-order warning/tile (`STALE_UNSETTLED_GRACE_HOURS=6`), snapshot columns
+`raw_forecast_value`/`bias_correction`/`bias_correction_n`/`bias_mae`, and
+`PERSIST_SHADOW_ORDERBOOK_JSON=false`. The Supabase ledger was then **reset (~2026-06-08 07:00 UTC)**;
+all pre-revamp counts (83 fills / −469¢) survive only in reports, not in the live DB.
+
+**Post-revamp fill volume is intentionally near zero.** With the shadow-gate experiment expired,
+`forecast_uncertainty_exceeds_strike_spacing` blocks 100% of 1°F temperature ladders (~85% of
+snapshots); the NO caps block most rain/band candidates. First post-reset fill:
+`KXRAINNYC-26JUN10-T0` BUY_NO @52¢ (clean, within caps).
+
+**Deadlock found and fixed (2026-06-09).** Bias correction/dynamic sigma read errors only from
+*settled fills* (`Store.forecast_error_stats`), but the gate prevents temperature fills — so the
+model could never collect the data needed to recalibrate and justify reopening the gate. Fix:
+1. `Store.counterfactual_candidates` is now settlement-aware: only closed markets, one latest
+   pre-close snapshot per ticker, skips tickers already resolved; gated temperature rows qualify
+   **regardless of model EV** (they are the calibration sample), other skip reasons still need
+   `COUNTERFACTUAL_MIN_EV_CENTS` (default 10¢).
+2. The runner (both shadow paths) runs a budgeted read-only backfill each iteration
+   (`counterfactual.run_backfill`; `COUNTERFACTUAL_BACKFILL_ENABLED=true`,
+   `COUNTERFACTUAL_MAX_FETCHES_PER_RUN=25` `get_market` calls), logging
+   `cf_candidates/cf_wrote/cf_resolved/cf_errors` in the runner event. CLI
+   `kalshi-weather-counterfactual` unchanged.
+3. `Store.forecast_error_stats` gained a third source: verified skipped snapshots
+   (`counterfactual_outcomes` ⋈ `shadow_snapshots`, error = `raw_forecast_value − result_value`),
+   so bias correction and dynamic sigma now calibrate **without any fills or gate relaxation**.
+4. Dashboard (settled page): "Skipped-trade counterfactuals" (would-be P/L by skip reason) and
+   "Verified forecast error on skipped markets" (per-series n/bias/MAE — watch MAE vs 1°F spacing).
+
+No order-submission path changed; the backfill is read-only production GETs using the shadow keys.
+`result_value` remains best-effort (same extractor as settled orders); strike-bracket inference
+across a ladder is a possible refinement.
+
+**Also fixed: silent series drop in `_usable`.** `paper.py`/`shadow.py` required `parsed.city`, so
+series whose market titles carry no city name (e.g. `KXHIGHNY` — 12 open parseable markets) were
+dropped **before any snapshot/signal was recorded**; only `KXHIGHCHI` and `KXRAINNYC` persisted
+post-reset. A known `stations.py` settlement-station mapping now counts as a location. Verified
+live: `KXHIGHNY` evaluates and records (gated) post-fix. Separately, `KXTEMPNYCH`/`KXTEMPCHIH`
+currently have **zero open markets on Kalshi's side** — hourly temperature absence is upstream, not
+a bot regression. Open follow-up: add `stations.py` entries (or series-level drop logging) for the
+other configured series (e.g. `KXHIGHAUS` is still silently dropped).
+
 ## 2026-06-08 shadow performance update — still losing, now with clean negative evidence
 A live Supabase review of the post-reset production-shadow ledger (`observations.md`, generated 2026-06-08 00:51 UTC) found:
 - **83 total shadow fills:** 79 settled, 4 open; all are simulated/read-only production-shadow fills.
@@ -305,15 +355,19 @@ Implemented before any live trading:
 7. Continuous runner can run it with `--production-shadow` at the recommended 15-minute cadence.
 
 ## Suggested next tasks
-The infrastructure tasks are done (shadow tables/mode, event caps, dashboard comparison, calibration). The open work is now **model quality and risk controls**, because current post-reset production-shadow results are negative (see `observations.md` and the 2026-06-08 section above):
-1. **Implement forecast bias correction** per station/series, variable, and target hour using stored `forecast_value` vs `result_value`; a global offset is misleading because cold and warm regimes cancel.
-2. **Recalibrate/widen `probability._sigma`** from settled shadow errors, separately for hourly temp, daily high/low bands, and rain/no-rain behavior.
-3. **Add adjacent-hour / same-day directional caps** for hourly temperature events so one persistent forecast-bias regime cannot create repeated same-direction losses across consecutive hours.
-4. **Add an asymmetric-risk guard for expensive BUY_NO trades**, especially rain and one-degree bucket markets where one miss wipes out many small wins.
-5. **Keep conservative forecast-uncertainty gating by default.** Do not extend relaxed temperature shadow trading as-is; any future relaxation should be bounded and read-only for calibration only.
-6. **Backfill skipped high-EV outcomes** so "missed trades" can be evaluated by actual settlement/counterfactual P&L, not model EV alone.
-7. **Monitor/fix stale unsettled shadow orders** (e.g. `shadow_orders.id=79` from the 2026-06-08 report) and add dashboard alerting for past-close `SHADOW_FILLED` rows.
-8. (Lower priority) Export multi-day CSV/JSON; verify `result_value` extraction against settlement JSON.
+Most infrastructure and risk-control tasks are now done (shadow tables/mode, event caps, dashboard
+comparison, calibration tooling, bias correction ✅ 2026-06-08, dynamic sigma ✅ 2026-06-08,
+adjacent-hour/same-day caps ✅ 2026-06-08, expensive-NO guards ✅ 2026-06-08, counterfactual
+backfill + verified-snapshot calibration loop ✅ 2026-06-09, stale-order alerting ✅). Open work:
+1. **Let the counterfactual loop accumulate verified data** (watch the "Verified forecast error on
+   skipped markets" tile), then evaluate whether per-hour bias-corrected MAE beats 1°F spacing for
+   any station/hour window before considering any bounded gate change.
+2. **Validate bias correction / dynamic sigma against the verified data** once n ≥ the configured
+   minimum samples per key; rerun `kalshi-weather-calib --source shadow` as fills (rain/band) settle.
+3. **Keep conservative forecast-uncertainty gating by default.** Any future relaxation should be
+   bounded, read-only, and justified by the verified-error data, not model EV.
+4. (Lower priority) Verify `result_value` extraction against settlement JSON (consider
+   strike-bracket inference across a ladder); export multi-day CSV/JSON.
 
 ## Caution for fresh agents
 Do not enable live trading. The project is still research/demo/shadow only, **and the current algorithm is empirically unprofitable on production-shadow data** — fix forecast quality/calibration first.

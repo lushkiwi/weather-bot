@@ -79,6 +79,17 @@ class Settings(BaseSettings):
     dynamic_sigma_source: str = Field(default="both", alias="DYNAMIC_SIGMA_SOURCE")
     dynamic_sigma_include_lookahead: bool = Field(default=False, alias="DYNAMIC_SIGMA_INCLUDE_LOOKAHEAD")
 
+    # --- Counterfactual settlement backfill (added 2026-06-09) ---
+    # Resolve settlement outcomes for markets the bot evaluated but *skipped* (especially
+    # temperature ladders blocked by the forecast-uncertainty gate). This is the read-only data
+    # source that lets bias correction / dynamic sigma calibrate without taking shadow fills:
+    # without it the conservative gate prevents any temperature row from ever settling, so the
+    # model could never gather the evidence needed to reopen the gate. One get_market read per
+    # closed ticker, budgeted per run; no order paths are involved.
+    counterfactual_backfill_enabled: bool = Field(default=True, alias="COUNTERFACTUAL_BACKFILL_ENABLED")
+    counterfactual_max_fetches_per_run: int = Field(default=25, alias="COUNTERFACTUAL_MAX_FETCHES_PER_RUN")
+    counterfactual_min_ev_cents: float = Field(default=10.0, alias="COUNTERFACTUAL_MIN_EV_CENTS")
+
     stale_unsettled_grace_hours: int = Field(default=6, alias="STALE_UNSETTLED_GRACE_HOURS")
     # Raw orderbook JSON is bulky and not used by the dashboard/model. Keep it off by default on
     # the free Supabase tier; enable only for short debugging windows.

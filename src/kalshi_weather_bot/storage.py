@@ -739,6 +739,16 @@ class Store:
                     has_variable_column=False,
                 )
             )
+            # Verified skipped snapshots: counterfactual settlement backfill resolves markets the
+            # gates refused to trade, so temperature bias/sigma can calibrate with zero fills.
+            errors.extend(
+                self._forecast_errors_from_counterfactuals(
+                    series_ticker=series_ticker,
+                    target_hour=target_hour,
+                    lookback_days=lookback_days,
+                    include_lookahead=include_lookahead,
+                )
+            )
         if not errors:
             return {"n": 0, "bias": None, "mae": None, "rmse": None}
         bias = sum(errors) / len(errors)
@@ -788,6 +798,59 @@ class Store:
             SELECT COALESCE(s.raw_forecast_value, s.forecast_value) AS fv, o.result_value AS rv
             FROM {order_table} o
             JOIN {signal_table} s ON s.id = o.{signal_fk}
+            WHERE {' AND '.join(where)}
+        """
+        out: list[float] = []
+        for row in self.conn.execute(sql, tuple(params)).fetchall():
+            try:
+                out.append(float(row["fv"]) - float(row["rv"]))
+            except (TypeError, ValueError):
+                continue
+        return out
+
+    def _forecast_errors_from_counterfactuals(
+        self,
+        *,
+        series_ticker: str,
+        target_hour: int | None,
+        lookback_days: int,
+        include_lookahead: bool,
+    ) -> list[float]:
+        """Forecast errors from settled-but-skipped shadow snapshots (counterfactual backfill).
+
+        ``result_value`` is the best-effort settlement value extracted from the Kalshi market
+        payload, same as the settled-order path; one outcome row per ticker is expected because
+        candidate selection dedupes to the latest pre-close snapshot.
+        """
+        where = [
+            "co.source = 'shadow'",
+            "co.result_value IS NOT NULL",
+            "co.ticker LIKE ?",
+            "s.forecast_value IS NOT NULL",
+        ]
+        params: list[Any] = [f"{series_ticker}-%"]
+        if target_hour is None:
+            where.append("s.target_hour IS NULL")
+        else:
+            where.append("s.target_hour = ?")
+            params.append(target_hour)
+        if not include_lookahead:
+            where.append("COALESCE(s.lookahead_risk, 0) = 0")
+        if lookback_days > 0:
+            if self.is_postgres:
+                where.append("s.created_at >= now() - make_interval(days => ?)")
+                params.append(lookback_days)
+            else:
+                where.append("s.created_at >= datetime('now', ?)")
+                params.append(f"-{lookback_days} days")
+        sql = f"""
+            SELECT COALESCE(s.raw_forecast_value, s.forecast_value) AS fv, co.result_value AS rv
+            FROM counterfactual_outcomes co
+            JOIN shadow_snapshots s ON s.id = co.source_row_id
+            JOIN (
+                SELECT ticker, MAX(id) AS max_id FROM counterfactual_outcomes
+                WHERE source = 'shadow' GROUP BY ticker
+            ) latest ON latest.max_id = co.id
             WHERE {' AND '.join(where)}
         """
         out: list[float] = []
@@ -974,6 +1037,11 @@ class Store:
         self.conn.commit()
         return count
 
+    # Skip reasons whose snapshots are fetched regardless of model EV: gated temperature rows are
+    # the calibration data that bias correction / dynamic sigma need, since the conservative gate
+    # prevents any temperature fills from settling.
+    COUNTERFACTUAL_ALWAYS_REASONS = ("forecast_uncertainty_exceeds_strike_spacing",)
+
     def counterfactual_candidates(
         self,
         *,
@@ -982,30 +1050,52 @@ class Store:
         limit: int = 50,
         skip_reason: str | None = None,
     ) -> list[dict[str, Any]]:
-        """High-model-EV skipped rows that can be audited after settlement."""
-        if source == "paper":
-            table = "signals"
-            source_id = "id"
-        else:
-            table = "shadow_snapshots"
-            source_id = "id"
+        """Skipped rows whose markets have closed and can be audited against settlement.
+
+        One candidate per ticker (the latest snapshot before close, stable after close since no new
+        snapshots are written), excluding tickers already resolved in ``counterfactual_outcomes``.
+        Rows skipped by the forecast-uncertainty gate qualify regardless of EV; other skip reasons
+        must clear ``min_ev_cents``.
+        """
+        table = "signals" if source == "paper" else "shadow_snapshots"
+        always = list(self.COUNTERFACTUAL_ALWAYS_REASONS)
         where = [
             "skipped_reason IS NOT NULL",
             "selected_side IS NOT NULL",
             "selected_price_cents IS NOT NULL",
-            "fee_adjusted_ev_cents >= ?",
+            "close_time IS NOT NULL",
         ]
-        params: list[Any] = [min_ev_cents]
+        params: list[Any] = []
+        if self.is_postgres:
+            where.append("close_time::timestamptz <= now()")
+        else:
+            where.append("datetime(close_time) <= datetime('now')")
+        reason_placeholders = ", ".join("?" for _ in always)
+        where.append(f"(skipped_reason IN ({reason_placeholders}) OR fee_adjusted_ev_cents >= ?)")
+        params.extend(always)
+        params.append(min_ev_cents)
         if skip_reason:
             where.append("skipped_reason = ?")
             params.append(skip_reason)
+        params.append(source)
         params.append(limit)
         sql = f"""
-            SELECT {source_id} AS source_row_id, ticker, selected_side, selected_price_cents,
-                   fee_cents, fee_adjusted_ev_cents, skipped_reason
-            FROM {table}
-            WHERE {' AND '.join(where)}
-            ORDER BY fee_adjusted_ev_cents DESC
+            SELECT t.id AS source_row_id, t.ticker, t.selected_side, t.selected_price_cents,
+                   t.fee_cents, t.fee_adjusted_ev_cents, t.skipped_reason
+            FROM {table} t
+            JOIN (
+                SELECT ticker, MAX(id) AS max_id
+                FROM {table}
+                WHERE {' AND '.join(where)}
+                GROUP BY ticker
+            ) latest ON latest.max_id = t.id
+            WHERE NOT EXISTS (
+                SELECT 1 FROM counterfactual_outcomes co
+                WHERE co.source = ?
+                  AND co.ticker = t.ticker
+                  AND (co.settlement_result IS NOT NULL OR co.result_value IS NOT NULL)
+            )
+            ORDER BY t.close_time ASC
             LIMIT ?
         """
         return [dict(row) for row in self.conn.execute(sql, tuple(params)).fetchall()]
@@ -1090,6 +1180,33 @@ class Store:
                 (source,),
             ).fetchall()
         ]
+
+    def counterfactual_forecast_summary(self, source: str = "shadow") -> list[dict[str, Any]]:
+        """Per-series verified forecast error from settled-but-skipped snapshots.
+
+        This is the dashboard's "is bias correction getting data?" view: n must grow and MAE
+        should be compared against the series' strike spacing.
+        """
+        series_expr = (
+            "split_part(x.ticker, '-', 1)"
+            if self.is_postgres
+            else "substr(x.ticker, 1, instr(x.ticker, '-') - 1)"
+        )
+        sql = f"""
+            SELECT {series_expr} AS series, COUNT(*) AS n,
+                   AVG(x.fv - x.rv) AS bias_f,
+                   AVG(ABS(x.fv - x.rv)) AS mae_f
+            FROM (
+                SELECT co.ticker, COALESCE(s.raw_forecast_value, s.forecast_value) AS fv,
+                       co.result_value AS rv
+                FROM counterfactual_outcomes co
+                JOIN shadow_snapshots s ON s.id = co.source_row_id
+                WHERE co.source = ? AND co.result_value IS NOT NULL AND s.forecast_value IS NOT NULL
+            ) x
+            GROUP BY series
+            ORDER BY n DESC
+        """
+        return [dict(row) for row in self.conn.execute(sql, (source,)).fetchall()]
 
     def mark_order_demo_rejected(self, order_id: int, reason: str | None = None) -> None:
         self.conn.execute(

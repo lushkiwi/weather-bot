@@ -13,7 +13,40 @@ This is a **research/demo/shadow-only** Kalshi trading bot. No live (production)
 
 For a fresh-agent handoff, read `PROJECT_STATUS.md` first, then `plan.md`.
 
-## Current status (2026-06-08): post-reset shadow remains empirically unprofitable
+## Current status (2026-06-09): second reset; calibrate-from-skips loop active
+
+The 2026-06-08 revamp shipped (commits `697e0b2`/`a911f11`, **not previously documented here**):
+per-station/variable/hour **forecast bias correction** (`forecast_adjustments.py`,
+`ENABLE_FORECAST_BIAS_CORRECTION=true`), **dynamic sigma widening** from realized residual RMSE
+(`ENABLE_DYNAMIC_SIGMA=true`; widen-only), **adjacent-hour/same-day directional caps**
+(`MAX_ADJACENT_HOUR_DIRECTIONAL_ORDERS=1`, `MAX_SAME_DAY_DIRECTIONAL_ORDERS=2`), **expensive/asymmetric
+BUY_NO price caps** (rain/band NO ≤65¢, hard NO cap 90¢, higher EV bar ≥60¢), a stale-unsettled
+shadow-order runner warning + dashboard tile, and `raw_forecast_value`/bias columns on snapshots.
+The Supabase ledger was then **reset again (~2026-06-08 07:00 UTC)** for clean post-revamp
+evaluation; pre-revamp rows exist only in the docs/old reports.
+
+**Expected behavior: very few shadow fills.** With the experiment gate auto-reverted (see below),
+`forecast_uncertainty_exceeds_strike_spacing` blocks ~all temperature ladders (~85% of snapshots)
+and the new NO-price caps block most rain/band candidates. This is intentional — the strategy was
+losing — but it starved the new calibration code, which read **only settled fills**.
+
+**Fix shipped 2026-06-09 — counterfactual calibration loop:** the runner now backfills settlement
+outcomes for *skipped* markets (`counterfactual.py` `run_backfill`, budgeted read-only
+`get_market` calls, `COUNTERFACTUAL_*` env vars; gated temperature rows qualify regardless of model
+EV) and `Store.forecast_error_stats` also reads verified skipped-snapshot errors
+(`counterfactual_outcomes` ⋈ `shadow_snapshots`). Bias correction and dynamic sigma therefore
+calibrate **with zero fills and no gate relaxation**. Dashboard: "Skipped-trade counterfactuals" +
+"Verified forecast error on skipped markets" tiles. Trade-frequency conclusion: low fill volume is
+correct; model improvement now comes from skipped-market verification, not from trading.
+
+Also fixed 2026-06-09: `_usable` in `paper.py`/`shadow.py` required a parsed city, silently dropping
+every market in series whose titles carry no city (e.g. `KXHIGHNY`) **before any snapshot was
+recorded** — a known station mapping now counts as a location. Note `KXTEMPNYCH`/`KXTEMPCHIH`
+currently list **zero open markets upstream** (Kalshi side), so hourly temp absence is not a bot
+bug. Series with neither city parse nor `stations.py` entry are still dropped; extending
+`stations.py` to all 27 configured series is open work.
+
+## Status history (2026-06-08): post-reset shadow remains empirically unprofitable
 
 Latest Supabase production-shadow review (`observations.md`, generated 2026-06-08 00:51 UTC): **83 shadow fills, 79 settled, 17/79 wins, −469¢** realized P/L on 2,169¢ cost basis. The first clean/non-lookahead sample is also negative (**7 fills, −172¢**) despite 90.7% mean predicted win probability. Calibration is poor (mean p_win 69.3% vs 21.5% empirical; Brier 0.386). The bot remains a read-only data collector/model-debugging tool; do not live trade.
 
