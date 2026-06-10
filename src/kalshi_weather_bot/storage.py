@@ -1052,10 +1052,14 @@ class Store:
     ) -> list[dict[str, Any]]:
         """Skipped rows whose markets have closed and can be audited against settlement.
 
-        One candidate per ticker (the latest snapshot before close, stable after close since no new
-        snapshots are written), excluding tickers already resolved in ``counterfactual_outcomes``.
-        Rows skipped by the forecast-uncertainty gate qualify regardless of EV; other skip reasons
-        must clear ``min_ev_cents``.
+        One candidate per ticker, preferring the latest *non-lookahead* snapshot (newest clean
+        forecast that did not peek at observed weather) and only falling back to the latest
+        overall snapshot when no clean one exists. This matters: the previous latest-before-close
+        selection produced exclusively ``lookahead_risk=1`` rows, which bias correction and
+        dynamic sigma are configured to ignore, so the calibrate-from-skips loop fed zero rows to
+        its consumers. Tickers already resolved in ``counterfactual_outcomes`` are excluded.
+        Rows skipped by the forecast-uncertainty gate qualify regardless of EV; other skip
+        reasons must clear ``min_ev_cents``.
         """
         table = "signals" if source == "paper" else "shadow_snapshots"
         always = list(self.COUNTERFACTUAL_ALWAYS_REASONS)
@@ -1080,22 +1084,27 @@ class Store:
         params.append(source)
         params.append(limit)
         sql = f"""
-            SELECT t.id AS source_row_id, t.ticker, t.selected_side, t.selected_price_cents,
-                   t.fee_cents, t.fee_adjusted_ev_cents, t.skipped_reason
-            FROM {table} t
-            JOIN (
-                SELECT ticker, MAX(id) AS max_id
-                FROM {table}
+            SELECT ranked.id AS source_row_id, ranked.ticker, ranked.selected_side,
+                   ranked.selected_price_cents, ranked.fee_cents, ranked.fee_adjusted_ev_cents,
+                   ranked.skipped_reason
+            FROM (
+                SELECT t.id, t.ticker, t.selected_side, t.selected_price_cents, t.fee_cents,
+                       t.fee_adjusted_ev_cents, t.skipped_reason, t.close_time,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY t.ticker
+                           ORDER BY COALESCE(t.lookahead_risk, 0) ASC, t.id DESC
+                       ) AS rn
+                FROM {table} t
                 WHERE {' AND '.join(where)}
-                GROUP BY ticker
-            ) latest ON latest.max_id = t.id
-            WHERE NOT EXISTS (
+            ) ranked
+            WHERE ranked.rn = 1
+              AND NOT EXISTS (
                 SELECT 1 FROM counterfactual_outcomes co
                 WHERE co.source = ?
-                  AND co.ticker = t.ticker
+                  AND co.ticker = ranked.ticker
                   AND (co.settlement_result IS NOT NULL OR co.result_value IS NOT NULL)
             )
-            ORDER BY t.close_time ASC
+            ORDER BY ranked.close_time ASC
             LIMIT ?
         """
         return [dict(row) for row in self.conn.execute(sql, tuple(params)).fetchall()]

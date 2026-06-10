@@ -29,6 +29,19 @@ FROM shadow_orders o JOIN shadow_snapshots ss ON ss.id = o.snapshot_id
 WHERE o.status = 'SHADOW_SETTLED' AND ss.probability_yes IS NOT NULL
 """
 
+# Settled-but-skipped markets from the counterfactual backfill. This measures the model's
+# decision quality (including the rain PoP model) on markets the gates refused to trade —
+# with zero capital at risk, it is usually the largest verified sample available.
+COUNTERFACTUAL_QUERY = """
+SELECT ss.probability_yes AS p, co.selected_side AS side, co.settlement_result AS res,
+       co.result_value AS rv, COALESCE(ss.raw_forecast_value, ss.forecast_value) AS fv,
+       COALESCE(ss.lookahead_risk, 0) AS look, co.ticker AS ticker,
+       co.counterfactual_pnl_cents AS pnl, ss.event_ticker AS event_ticker
+FROM counterfactual_outcomes co JOIN shadow_snapshots ss ON ss.id = co.source_row_id
+WHERE co.source = 'shadow' AND co.settlement_result IS NOT NULL
+  AND ss.probability_yes IS NOT NULL AND co.selected_side IS NOT NULL
+"""
+
 
 @dataclass
 class CalibrationReport:
@@ -52,7 +65,7 @@ def _series_prefix(ticker: str) -> str:
 
 
 def compute_calibration(store: Store, source: str = "paper", include_lookahead: bool = False, bins: int = 10) -> CalibrationReport:
-    query = PAPER_QUERY if source == "paper" else SHADOW_QUERY
+    query = {"paper": PAPER_QUERY, "shadow": SHADOW_QUERY, "counterfactual": COUNTERFACTUAL_QUERY}[source]
     rows = [dict(r) for r in store.conn.execute(query).fetchall()]
     report = CalibrationReport(source=source)
 
@@ -129,12 +142,17 @@ def format_report(report: CalibrationReport) -> str:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Calibration & forecast-error report for settled paper/shadow orders")
     parser.add_argument("--db", default="data/kalshi_weather.sqlite")
-    parser.add_argument("--source", choices=["paper", "shadow", "both"], default="both")
+    parser.add_argument("--source", choices=["paper", "shadow", "counterfactual", "both", "all"], default="both")
     parser.add_argument("--include-lookahead", action="store_true", help="Include same-day/elapsed markets (leakage-inflated)")
     args = parser.parse_args(argv)
 
     store = Store(Settings().database_url or args.db)
-    sources = ["paper", "shadow"] if args.source == "both" else [args.source]
+    if args.source == "both":
+        sources = ["paper", "shadow"]
+    elif args.source == "all":
+        sources = ["paper", "shadow", "counterfactual"]
+    else:
+        sources = [args.source]
     for source in sources:
         report = compute_calibration(store, source=source, include_lookahead=args.include_lookahead)
         print(format_report(report))

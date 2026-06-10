@@ -70,14 +70,44 @@ class Settings(BaseSettings):
     forecast_bias_source: str = Field(default="both", alias="FORECAST_BIAS_SOURCE")
     forecast_bias_include_lookahead: bool = Field(default=False, alias="FORECAST_BIAS_INCLUDE_LOOKAHEAD")
 
-    # Inflate sigma from realized residual RMSE where enough rows exist. This deliberately only
-    # widens the hardcoded baseline; it never narrows sigma from a small/noisy sample.
+    # Calibrate sigma from realized residual RMSE where enough rows exist. Widening activates at
+    # ``DYNAMIC_SIGMA_MIN_SAMPLES``; narrowing below the baseline requires the larger
+    # ``DYNAMIC_SIGMA_NARROW_MIN_SAMPLES`` of verified *non-lookahead* errors and is floored at
+    # ``DYNAMIC_SIGMA_MIN_F``. Without narrowing the gate state is absorbing: evidence that the
+    # forecast is better than the hardcoded baseline could never reopen trading (2026-06-10).
     enable_dynamic_sigma: bool = Field(default=True, alias="ENABLE_DYNAMIC_SIGMA")
     dynamic_sigma_min_samples: int = Field(default=5, alias="DYNAMIC_SIGMA_MIN_SAMPLES")
     dynamic_sigma_multiplier: float = Field(default=1.75, alias="DYNAMIC_SIGMA_MULTIPLIER")
     dynamic_sigma_max_f: float = Field(default=14.0, alias="DYNAMIC_SIGMA_MAX_F")
     dynamic_sigma_source: str = Field(default="both", alias="DYNAMIC_SIGMA_SOURCE")
     dynamic_sigma_include_lookahead: bool = Field(default=False, alias="DYNAMIC_SIGMA_INCLUDE_LOOKAHEAD")
+    dynamic_sigma_allow_narrowing: bool = Field(default=True, alias="DYNAMIC_SIGMA_ALLOW_NARROWING")
+    dynamic_sigma_narrow_min_samples: int = Field(default=12, alias="DYNAMIC_SIGMA_NARROW_MIN_SAMPLES")
+    dynamic_sigma_min_f: float = Field(default=1.5, alias="DYNAMIC_SIGMA_MIN_F")
+
+    # --- Forecast/model input upgrades (added 2026-06-10) ---
+    # Day-specific sigma from the Open-Meteo ensemble spread (plus a station-basis term in
+    # quadrature) instead of the hardcoded climatological table, which was simultaneously too
+    # tight for hourly temps and too wide for daily highs (fake tail EV).
+    enable_ensemble_sigma: bool = Field(default=True, alias="ENABLE_ENSEMBLE_SIGMA")
+    ensemble_sigma_models: str = Field(default="gfs_seamless", alias="ENSEMBLE_SIGMA_MODELS")
+    ensemble_sigma_multiplier: float = Field(default=1.1, alias="ENSEMBLE_SIGMA_MULTIPLIER")
+    ensemble_basis_sigma_f: float = Field(default=1.5, alias="ENSEMBLE_BASIS_SIGMA_F")
+    ensemble_min_members: int = Field(default=8, alias="ENSEMBLE_MIN_MEMBERS")
+
+    # Blend the NWS point forecast into temperature means. The daily series settle on NWS
+    # climate reports, so this is the settlement-source-matched forecast; weight is the NWS
+    # share (0 disables in effect, 1 means NWS-only when available).
+    enable_nws_forecast: bool = Field(default=True, alias="ENABLE_NWS_FORECAST")
+    nws_forecast_weight: float = Field(default=0.5, alias="NWS_FORECAST_WEIGHT")
+
+    # Blend the model probability toward the market-implied probability in logit space. Every
+    # dataset so far (settled fills and skipped-trade counterfactuals) shows the market beating
+    # the model, so the market price is treated as an informed prior and the model must
+    # out-argue it by a wide margin before any EV appears.
+    enable_market_prob_blend: bool = Field(default=True, alias="ENABLE_MARKET_PROB_BLEND")
+    market_prob_blend_model_weight: float = Field(default=0.35, alias="MARKET_PROB_BLEND_MODEL_WEIGHT")
+    market_prob_blend_max_spread_cents: float = Field(default=30.0, alias="MARKET_PROB_BLEND_MAX_SPREAD_CENTS")
 
     # --- Counterfactual settlement backfill (added 2026-06-09) ---
     # Resolve settlement outcomes for markets the bot evaluated but *skipped* (especially

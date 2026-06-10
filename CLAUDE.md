@@ -13,7 +13,48 @@ This is a **research/demo/shadow-only** Kalshi trading bot. No live (production)
 
 For a fresh-agent handoff, read `PROJECT_STATUS.md` first, then `plan.md`.
 
-## Current status (2026-06-09): second reset; calibrate-from-skips loop active
+## Current status (2026-06-10): model-input revamp; calibration loop actually unblocked
+
+A from-the-data review found the 2026-06-09 counterfactual loop was **structurally inert**:
+candidate selection took the latest snapshot before close, which is `lookahead_risk=1` by
+construction, while bias correction/dynamic sigma exclude lookahead rows by default — so zero
+snapshots ever received a correction (verified: `bias_correction≠0` on 0 of 4,885 post-reset
+rows). Dynamic sigma was also widen-only, making the gate state absorbing (no evidence could
+ever reopen trading). Meanwhile the first 18 resolved gate-skipped counterfactuals (avg model
+EV +17.9¢) would **all have lost** — the market beat the model in every sample so far.
+
+Shipped 2026-06-10 (all read-only; **no schema changes** — new model metadata rides in
+`model_source`):
+
+- **Counterfactual candidates prefer the latest non-lookahead snapshot** per ticker
+  (`Store.counterfactual_candidates`, window function; falls back to latest-overall only when
+  no clean row exists), so verified errors now reach the calibration consumers.
+- **Dynamic sigma can narrow** below baseline: `DYNAMIC_SIGMA_ALLOW_NARROWING=true` with a
+  stricter clean-sample bar (`DYNAMIC_SIGMA_NARROW_MIN_SAMPLES=12`) and floor
+  (`DYNAMIC_SIGMA_MIN_F=1.5`); narrowing refuses to run off lookahead-contaminated stats.
+- **`ForecastEngine` (`forecast_sources.py`)** now feeds both `paper.py` and `shadow.py`:
+  Open-Meteo blended with the **NWS point forecast** for temperature markets
+  (`ENABLE_NWS_FORECAST`, `nws.py`, settlement-source-matched, best-effort/degrading) and
+  **day-specific ensemble-spread sigma** (`ENABLE_ENSEMBLE_SIGMA`, Open-Meteo ensemble API,
+  station-basis term added in quadrature, ≥8 members) replacing the hardcoded sigma table.
+- **Market-implied prior blend** (`ENABLE_MARKET_PROB_BLEND`): traded `probability_yes` is a
+  logit blend of model (weight `MARKET_PROB_BLEND_MODEL_WEIGHT=0.35`) and book mid (ask
+  fallback on wide/one-sided books). This kills the fake tail EV on 1¢ lottery asks; the raw
+  model probability stays recoverable from the `model_source` suffix.
+- **`stations.py` covers all 27 configured series**, verified against the Kalshi API
+  `settlement_sources` (2026-06-10): Austin settles at **Bergstrom (KAUS), not Camp Mabry**;
+  hourly Chicago (`KXTEMPCHIH`) is **O'Hare (KORD)** — the previous Midway mapping was wrong.
+  Monthly-rain stations are assumed (Kalshi lists only generic weather.gov) and labeled so.
+- **Per-series coverage logging**: each scan writes a `series_coverage` runner event naming
+  configured series with zero evaluations (`no_open_markets` vs bot-side drop reasons).
+- **`kalshi-weather-calib --source counterfactual`** (and `all`): Brier/reliability over
+  settled-but-skipped markets — the largest verified sample; also audits the rain PoP model.
+
+Expected post-deploy behavior: still ~zero fills (the blend shrinks EV further), but the
+counterfactual loop now produces clean rows, sigma tracks day-specific ensemble spread + can
+legitimately narrow on verified evidence, and coverage gaps across the 27 series are visible.
+
+## Status history (2026-06-09): second reset; calibrate-from-skips loop active
 
 The 2026-06-08 revamp shipped (commits `697e0b2`/`a911f11`, **not previously documented here**):
 per-station/variable/hour **forecast bias correction** (`forecast_adjustments.py`,
@@ -43,8 +84,8 @@ Also fixed 2026-06-09: `_usable` in `paper.py`/`shadow.py` required a parsed cit
 every market in series whose titles carry no city (e.g. `KXHIGHNY`) **before any snapshot was
 recorded** — a known station mapping now counts as a location. Note `KXTEMPNYCH`/`KXTEMPCHIH`
 currently list **zero open markets upstream** (Kalshi side), so hourly temp absence is not a bot
-bug. Series with neither city parse nor `stations.py` entry are still dropped; extending
-`stations.py` to all 27 configured series is open work.
+bug. Series with neither city parse nor `stations.py` entry are still dropped; ~~extending
+`stations.py` to all 27 configured series is open work~~ (done 2026-06-10, see above).
 
 ## Status history (2026-06-08): post-reset shadow remains empirically unprofitable
 
@@ -144,8 +185,8 @@ For each configured series → each market:
 
 1. `_market_is_tradeable` — skip non-`active/open` status or past `close_time`.
 2. `market_parser.parse_market` — extract city / variable / target date / target hour, and the strike via `parse_strike_from_ticker`: one-sided `threshold`+`comparator` for `-T##`, or `band_lower`/`band_upper` for `-B##.#` bucket markets. POINT_TEMP_F markets require a target hour.
-3. Location + forecast — `stations.station_for_ticker` gives exact settlement coordinates (preferred); else `weather.geocode`. Then Open-Meteo forecast (free/keyless), cached per run. Same-day/elapsed contracts get `lookahead_risk=1` (forecast leaks observed weather).
-4. `probability.estimate_probability` — normal model → `P(YES)`. Bands use `P(lo≤X<hi)`; rain "any-rain" markets use a `direct_probability` from `precipitation_probability_max`. `_sigma` was recalibrated wider on 2026-05-28 (lead-0 point-temp 4.5°F); `strike_spacing`/`forecast_resolves_strikes` back the uncertainty gate.
+3. Location + forecast — `stations.station_for_ticker` gives exact settlement coordinates (preferred); else geocoding. Forecast inputs come from `forecast_sources.ForecastEngine` (shared by paper/shadow, cached per run): Open-Meteo blended with the NWS point forecast for temperature markets, plus day-specific ensemble-spread sigma. Same-day/elapsed contracts get `lookahead_risk=1` (forecast leaks observed weather).
+4. `probability.estimate_probability` — normal model → `P(YES)`. Bands use `P(lo≤X<hi)`; rain "any-rain" markets use a `direct_probability` from `precipitation_probability_max`. The traded probability is then blended toward the market-implied prior (`ENABLE_MARKET_PROB_BLEND`, logit space). `strike_spacing`/`forecast_resolves_strikes` back the uncertainty gate.
 5. `orderbook.parse_orderbook` / `parse_market_quote` — current YES/NO quotes and sizes.
 6. Build **BUY_YES** and **BUY_NO** `TradeCandidate`s, compute fee-adjusted EV via `fees.FeeModel`:
    - YES EV = `P(YES)*100 − YES ask − fee`
@@ -164,7 +205,8 @@ Skip reasons (recorded on the signal) drive dashboard metrics; `no_executable_li
 - `kalshi_client.py` — authenticated REST client. Signs `timestamp+method+path` with RSA-PSS/SHA256 (`cryptography`). Has 429 retry/backoff and embeds response body in `HTTPError`. `is_demo` gates execution. Demo `/portfolio/positions` is queried without params (some param combos return 401).
 - `safety.py` — `SafetyGuard`: min fee-adjusted EV, minimum selected-side win probability (`MIN_TRADE_PROBABILITY`), side-aware price bounds, max orders/day, per-market cooldown, opposite-side block, max contracts/market, **per-event caps** (`DISALLOW_MULTIPLE_POSITIONS_PER_EVENT`, `MAX_CONTRACTS_PER_EVENT`, `MAX_EVENT_EXPOSURE_CENTS`; `_event_ticker` groups per city/day/**hour**), max total exposure. All from env.
 - `probability.py` — normal-CDF fair value. `_sigma(variable, lead_days)` (recalibrated wider 2026-05-28); band + `direct_probability` (rain) branches; clamps to [0.01, 0.99]. Also exposes `strike_spacing` + `forecast_resolves_strikes` for the uncertainty gate. Calibrate `_sigma` further from `kalshi-weather-calib` as data settles.
-- `stations.py` — series-prefix → `(lat, lon, source_label)` for exact settlement stations (NYC Central Park, Chicago Midway, …); falls back to geocoding.
+- `stations.py` — series-prefix → `(lat, lon, source_label)` for exact settlement stations; all 27 configured series are mapped (verified against Kalshi API `settlement_sources` 2026-06-10; monthly-rain entries are assumed/labeled). Falls back to geocoding for unknown series.
+- `forecast_sources.py` — `ForecastEngine`: shared forecast-input layer for paper/shadow (Open-Meteo value, NWS blend, ensemble sigma, rain PoP, per-run caches). `nws.py` — best-effort api.weather.gov point-forecast client (degrades to Open-Meteo-only on failure).
 - `calibration.py` / `kalshi-weather-calib` — joins settled orders to their predicted probability; computes Brier, log loss, reliability bins, forecast MAE/bias, independent-event counts. Excludes `lookahead_risk` rows by default.
 - `demo_execution.py` — demo-only FOK order backend (`buy_yes_fok`, `buy_no_fok`, `snapshot_portfolio`).
 - `shadow.py` / `shadow_cli.py` — Phase 2.75: same scan logic against the production read API, writes `shadow_snapshots`/`shadow_orders`, tracks shadow P/L separately. Never posts orders.

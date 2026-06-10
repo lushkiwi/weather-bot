@@ -14,6 +14,11 @@ class WeatherVariable(str, Enum):
     UNKNOWN = "unknown"
 
 
+# Variables whose markets resolve on a temperature reading; used by the uncertainty gate,
+# ensemble sigma, and the NWS forecast blend.
+TEMP_VARIABLES = {WeatherVariable.POINT_TEMP_F, WeatherVariable.HIGH_TEMP_F, WeatherVariable.LOW_TEMP_F}
+
+
 @dataclass(frozen=True)
 class ParsedWeatherMarket:
     ticker: str

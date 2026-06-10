@@ -7,15 +7,21 @@ from .config import Settings
 from .demo_execution import DemoExecutor
 from .fees import FeeModel
 from .forecast_adjustments import apply_forecast_adjustments
+from .forecast_sources import ForecastEngine
 from .kalshi_client import KalshiClient
 from .market_parser import parse_market
-from .models import WeatherVariable
+from .models import TEMP_VARIABLES, WeatherVariable
 from .orderbook import parse_market_quote, parse_orderbook
-from .probability import base_sigma, estimate_probability, forecast_resolves_strikes, strike_spacing
+from .probability import (
+    blend_probabilities,
+    estimate_probability,
+    forecast_resolves_strikes,
+    market_implied_probability,
+    strike_spacing,
+)
 from .safety import SafetyGuard
 from .stations import station_for_ticker
 from .storage import Store
-from .weather import OpenMeteoClient, value_for_variable
 
 
 @dataclass(frozen=True)
@@ -46,11 +52,6 @@ class TradeCandidate:
         return self.ask_cents is not None and self.ask_cents > 0 and self.ask_size > 0
 
 
-# Skip reasons that are decided without looking at current portfolio state. They are computed in
-# the evaluation pass so events can compete on EV before any stateful safety check runs.
-TEMP_VARIABLES = {WeatherVariable.POINT_TEMP_F, WeatherVariable.HIGH_TEMP_F, WeatherVariable.LOW_TEMP_F}
-
-
 @dataclass
 class _Evaluation:
     """Everything needed to persist one market's signal/order, computed without portfolio state."""
@@ -74,15 +75,12 @@ class PaperTrader:
     ):
         self.settings = settings
         self.kalshi = KalshiClient(settings)
-        self.weather = OpenMeteoClient(settings)
+        self.forecasts = ForecastEngine(settings)
         self.store = store
         self.quantity = quantity
         self.fee_model = fee_model or FeeModel()
         self.demo_executor = demo_executor
         self.safety_guard = safety_guard or SafetyGuard()
-        self._geo_cache: dict[str, tuple[float, float, str] | None] = {}
-        self._hourly_cache: dict[tuple[float, float, object, int], float | None] = {}
-        self._daily_cache: dict[tuple[float, float, object], dict | None] = {}
 
     def run_once(self, limit: int) -> PaperRunResult:
         series_tickers = self.settings.series_ticker_list()
@@ -96,18 +94,26 @@ class PaperTrader:
             for market in self.kalshi.iter_markets(limit=limit, series_ticker=series_ticker)
         ) if series_tickers else self.kalshi.iter_markets(limit=limit)
 
-        # Pass 1: evaluate every market without touching portfolio state.
+        # Pass 1: evaluate every market without touching portfolio state. Per-series drop
+        # reasons are tallied so configured series that never produce a signal are visible
+        # (no open markets upstream vs bot-side parse/location/forecast drops).
         evaluations: list[_Evaluation] = []
+        coverage: dict[str, dict[str, int]] = {}
         for market in market_iter:
             totals["markets_seen"] += 1
+            series_cov = coverage.setdefault(str(market.get("ticker") or "").split("-", 1)[0], {})
             try:
                 evaluation = self._evaluate_market(market)
             except Exception as exc:  # noqa: BLE001
                 totals["market_errors"] += 1
+                series_cov["error"] = series_cov.get("error", 0) + 1
                 self.store.insert_runner_event("error", f"paper_market_error ticker={market.get('ticker')} {type(exc).__name__}: {exc}")
                 continue
-            if evaluation is not None:
-                evaluations.append(evaluation)
+            if isinstance(evaluation, str):
+                series_cov[evaluation] = series_cov.get(evaluation, 0) + 1
+                continue
+            series_cov["evaluated"] = series_cov.get("evaluated", 0) + 1
+            evaluations.append(evaluation)
 
         # Best-strike-per-event: within one event the strikes are ~perfectly correlated, so only
         # the single highest-EV tradeable strike is allowed to become an order; the rest are
@@ -117,6 +123,8 @@ class PaperTrader:
         # Pass 2: persist signals in evaluation order, applying stateful safety to the survivors.
         for evaluation in evaluations:
             self._persist_evaluation(scan_id, evaluation, totals)
+
+        _log_series_coverage(self.store, "paper", scan_id, series_tickers, coverage)
 
         return PaperRunResult(
             scan_id,
@@ -130,27 +138,28 @@ class PaperTrader:
             totals["market_errors"],
         )
 
-    def _evaluate_market(self, market: dict) -> _Evaluation | None:
+    def _evaluate_market(self, market: dict) -> _Evaluation | str:
         """Compute a market's signal payload and best candidate without any portfolio state.
 
-        Returns None when the market is not parseable/usable or has no forecast; otherwise an
-        ``_Evaluation`` whose ``stateless_skip`` is set if the trade is rejected for a reason that
-        does not depend on current positions (no liquidity, missing edge, uncertainty gate).
+        Returns a drop-reason string when the market is not parseable/usable or has no
+        forecast (tallied per series for coverage logging); otherwise an ``_Evaluation`` whose
+        ``stateless_skip`` is set if the trade is rejected for a reason that does not depend on
+        current positions (no liquidity, missing edge, uncertainty gate).
         """
         if not _market_is_tradeable(market):
-            return None
+            return "not_tradeable"
         parsed = parse_market(market)
         if not parsed or not self._usable(parsed):
-            return None
+            return "unparseable_or_unusable"
 
         # Prefer the exact settlement-station coordinates over a city-name geocode.
-        geo = station_for_ticker(parsed.ticker) or self._geocode(parsed.city or "")
+        geo = station_for_ticker(parsed.ticker) or self.forecasts.geocode(parsed.city or "")
         if not geo:
-            return None
+            return "no_location"
 
-        forecast_value = self._forecast_value(geo[0], geo[1], parsed)
+        forecast_value, forecast_note = self.forecasts.value(geo[0], geo[1], parsed)
         if forecast_value is None:
-            return None
+            return "no_forecast"
 
         quote = parse_orderbook(self.kalshi.get_orderbook(parsed.ticker))
         market_quote = parse_market_quote(market)
@@ -164,6 +173,7 @@ class PaperTrader:
             market.get("yes_bid_size_fp"),
         )
 
+        sigma_base_value, sigma_note = self.forecasts.sigma_base(geo[0], geo[1], parsed)
         adjustment = apply_forecast_adjustments(
             store=self.store,
             settings=self.settings,
@@ -172,9 +182,9 @@ class PaperTrader:
             target_date=parsed.target_date,  # type: ignore[arg-type]
             target_hour=parsed.target_hour,
             raw_mean=forecast_value,
-            base_sigma=base_sigma(parsed.variable, parsed.target_date),  # type: ignore[arg-type]
+            base_sigma=sigma_base_value,
         )
-        source_bits = []
+        source_bits = [bit for bit in (forecast_note, sigma_note) if bit]
         if adjustment.used_bias_correction:
             source_bits.append(f"bias_corrected_n{adjustment.bias_samples}")
         if adjustment.used_dynamic_sigma:
@@ -187,16 +197,36 @@ class PaperTrader:
             comparator=parsed.comparator,
             band_lower=parsed.band_lower,
             band_upper=parsed.band_upper,
-            direct_probability=self._rain_probability(geo[0], geo[1], parsed),
+            direct_probability=self.forecasts.rain_probability(geo[0], geo[1], parsed),
             sigma_override=adjustment.sigma,
             source_suffix="+".join(source_bits) if source_bits else None,
         )
-        fair_yes = estimate.probability_yes * 100.0
-        fair_no = (1.0 - estimate.probability_yes) * 100.0
+
+        # Market-implied prior: the book has beaten the model in every dataset so far, so the
+        # traded probability is the model blended toward the market price; the raw model value
+        # stays recoverable from the source suffix.
+        probability_yes = estimate.probability_yes
+        model_source = estimate.source
+        if self.settings.enable_market_prob_blend:
+            p_market = market_implied_probability(
+                quote.yes_bid, quote.yes_ask, self.settings.market_prob_blend_max_spread_cents
+            )
+            if p_market is not None:
+                blended = blend_probabilities(
+                    probability_yes, p_market, self.settings.market_prob_blend_model_weight
+                )
+                model_source += (
+                    f"+mktblend_w{self.settings.market_prob_blend_model_weight:g}"
+                    f"_raw{probability_yes:.3f}_mkt{p_market:.3f}"
+                )
+                probability_yes = blended
+
+        fair_yes = probability_yes * 100.0
+        fair_no = (1.0 - probability_yes) * 100.0
 
         candidates = [
-            self._candidate("BUY_YES", quote.yes_ask, yes_ask_size, estimate.probability_yes),
-            self._candidate("BUY_NO", quote.no_ask, no_ask_size, 1.0 - estimate.probability_yes),
+            self._candidate("BUY_YES", quote.yes_ask, yes_ask_size, probability_yes),
+            self._candidate("BUY_NO", quote.no_ask, no_ask_size, 1.0 - probability_yes),
         ]
         liquid = [c for c in candidates if c.ask_size >= self.quantity and c.ask_cents is not None and c.ask_cents > 0]
         selected = max(liquid, key=lambda c: c.ev_cents if c.ev_cents is not None else -10_000.0) if liquid else max(candidates, key=lambda c: c.ev_cents if c.ev_cents is not None else -10_000.0)
@@ -226,11 +256,11 @@ class PaperTrader:
             "raw_forecast_value": adjustment.raw_mean,
             "forecast_value": estimate.mean,
             "forecast_sigma": estimate.sigma,
-            "model_source": estimate.source,
+            "model_source": model_source,
             "bias_correction": adjustment.bias_correction,
             "bias_correction_n": adjustment.bias_samples,
             "bias_mae": adjustment.bias_mae,
-            "probability_yes": estimate.probability_yes,
+            "probability_yes": probability_yes,
             "fair_yes_cents": fair_yes,
             "fair_no_cents": fair_no,
             "yes_bid_cents": quote.yes_bid,
@@ -348,34 +378,6 @@ class PaperTrader:
         ev = self.fee_model.buy_ev_cents(probability_win, ask_cents, self.quantity) if ask_cents is not None else None
         return TradeCandidate(side, ask_cents, ask_size, probability_win, fair, fee, ev)
 
-    def _forecast_value(self, lat: float, lon: float, parsed) -> float | None:
-        if parsed.variable == WeatherVariable.POINT_TEMP_F and parsed.target_hour is not None:
-            key = (lat, lon, parsed.target_date, parsed.target_hour)
-            if key not in self._hourly_cache:
-                self._hourly_cache[key] = self.weather.hourly_temperature(lat, lon, parsed.target_date, parsed.target_hour)
-            return self._hourly_cache[key]
-        key = (lat, lon, parsed.target_date)
-        if key not in self._daily_cache:
-            self._daily_cache[key] = self.weather.daily_forecast(lat, lon, parsed.target_date)
-        return value_for_variable(self._daily_cache[key] or {}, parsed.variable)
-
-    def _geocode(self, city: str) -> tuple[float, float, str] | None:
-        if city not in self._geo_cache:
-            self._geo_cache[city] = self.weather.geocode(city)
-        return self._geo_cache[city]
-
-    def _rain_probability(self, lat: float, lon: float, parsed) -> float | None:
-        """Forecast precipitation probability for an "any rain" market, else None."""
-        if parsed.variable != WeatherVariable.RAIN_IN or parsed.threshold is None or parsed.threshold > 0.25:
-            return None
-        daily = self._daily_cache.get((lat, lon, parsed.target_date))
-        if not daily:
-            return None
-        try:
-            return float(daily.get("precipitation_probability_max")) / 100.0
-        except (TypeError, ValueError):
-            return None
-
     def _usable(self, parsed) -> bool:
         # A known settlement station is as good a location as a parsed city name: many series
         # (e.g. KXHIGHNY) carry no city in the title, and requiring one silently dropped every
@@ -388,6 +390,27 @@ class PaperTrader:
             and parsed.variable != WeatherVariable.UNKNOWN
             and (parsed.variable != WeatherVariable.POINT_TEMP_F or parsed.target_hour is not None)
         )
+
+
+def _log_series_coverage(
+    store: Store, label: str, scan_id: int, series_tickers: list[str], coverage: dict[str, dict[str, int]]
+) -> None:
+    """One runner event per scan naming configured series that produced no evaluations.
+
+    Distinguishes "no open markets upstream" from bot-side drops (unparseable ticker/title, no
+    station or city, no forecast) so coverage gaps are observable instead of silently inferred.
+    Only 3 of 27 configured series were producing snapshots before this existed.
+    """
+    problems = []
+    for series in series_tickers:
+        series_cov = coverage.get(series)
+        if not series_cov:
+            problems.append(f"{series}=no_open_markets")
+        elif not series_cov.get("evaluated"):
+            detail = ",".join(f"{reason}:{count}" for reason, count in sorted(series_cov.items()))
+            problems.append(f"{series}={detail}")
+    if problems:
+        store.insert_runner_event("info", f"series_coverage source={label} scan_id={scan_id} " + " ".join(problems))
 
 
 def _event_ticker(ticker: str) -> str:

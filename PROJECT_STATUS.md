@@ -14,6 +14,24 @@ Implemented phases:
 
 Current cloud mode is **Phase 2.75 shadow-only** on Railway/Supabase: production prices are read, shadow fills are simulated, and no demo/live orders are placed.
 
+## 2026-06-10 model-input revamp + calibration-loop fixes
+A live-ledger review found the 2026-06-09 calibrate-from-skips loop was structurally inert
+(every counterfactual row was `lookahead_risk=1` because candidates took the latest pre-close
+snapshot, while bias correction/dynamic sigma exclude lookahead rows — 0 corrections ever
+applied), dynamic sigma was widen-only (the uncertainty gate was an absorbing state), and the
+first 18 resolved gate-skipped counterfactuals would all have lost despite +17.9¢ avg model EV.
+Shipped, all read-only and schema-free (details in `CLAUDE.md` → "Current status (2026-06-10)"):
+counterfactual candidates now prefer the latest **non-lookahead** snapshot; dynamic sigma may
+**narrow** on a stricter clean sample (floor `DYNAMIC_SIGMA_MIN_F`); a shared
+`ForecastEngine` adds the **NWS point-forecast blend** (settlement-source-matched) and
+**ensemble-spread sigma**; the traded probability is **blended toward the market price**
+(logit, model weight 0.35); `stations.py` now covers **all 27 series** with Kalshi-API-verified
+settlement stations (Austin = Bergstrom, hourly Chicago = O'Hare — both prior assumptions were
+wrong); per-series `series_coverage` runner events expose silent coverage gaps; and
+`kalshi-weather-calib --source counterfactual` reports calibration on settled-but-skipped
+markets. Expected: still ~zero fills (blend shrinks EV), but the calibration loop finally
+feeds clean verified errors to its consumers.
+
 ## 2026-06-02 cloud migration (now hosted on Railway + Supabase)
 The bot no longer runs self-hosted on Windows. It is deployed to the cloud:
 - **Supabase Postgres** (project `weather-bot`, ref `xtttchcsmlzjsxcnrttb`) is the hosted database;

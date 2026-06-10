@@ -100,5 +100,50 @@ def forecast_resolves_strikes(sigma: float, spacing: float, ratio: float) -> boo
     return sigma < ratio * spacing
 
 
+def market_implied_probability(
+    yes_bid_cents: float | None,
+    yes_ask_cents: float | None,
+    max_spread_cents: float,
+) -> float | None:
+    """P(YES) implied by the order book, or None when the book carries no usable signal.
+
+    Uses the bid/ask mid when the spread is tight enough to mean something; falls back to the
+    ask alone on one-sided/wide books. The ask fallback is deliberately conservative: cheap
+    far-strike asks (the 1c lottery tickets that produced fake model EV) blend the probability
+    toward the market's near-zero pricing instead of trusting the model's inflated tails.
+    """
+    ask = yes_ask_cents if yes_ask_cents is not None and yes_ask_cents > 0 else None
+    if ask is None:
+        return None
+    bid = yes_bid_cents if yes_bid_cents is not None and yes_bid_cents > 0 else None
+    if bid is not None and bid <= ask and (ask - bid) <= max_spread_cents:
+        implied = (bid + ask) / 2.0 / 100.0
+    else:
+        implied = ask / 100.0
+    return min(max(implied, 0.01), 0.99)
+
+
+def blend_probabilities(p_model: float, p_market: float, model_weight: float) -> float:
+    """Logit-space blend of the model and market-implied probabilities.
+
+    The market price is treated as an informed prior; the model only moves the trading
+    probability in proportion to ``model_weight``. With a poorly calibrated model this kills
+    the fake EV that pure model-vs-market disagreement manufactures, while still letting a
+    genuinely informed forecast shift the estimate.
+    """
+    weight = min(max(model_weight, 0.0), 1.0)
+    blended = _sigmoid(weight * _logit(p_model) + (1.0 - weight) * _logit(p_market))
+    return min(max(blended, 0.01), 0.99)
+
+
+def _logit(p: float) -> float:
+    p = min(max(p, 1e-6), 1.0 - 1e-6)
+    return math.log(p / (1.0 - p))
+
+
+def _sigmoid(x: float) -> float:
+    return 1.0 / (1.0 + math.exp(-x))
+
+
 def _normal_cdf(x: float) -> float:
     return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))

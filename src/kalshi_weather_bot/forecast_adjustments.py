@@ -45,7 +45,9 @@ def apply_forecast_adjustments(
     - bias correction only activates after ``FORECAST_BIAS_MIN_SAMPLES`` rows for the exact
       series/variable/hour key (hour is used for POINT_TEMP_F);
     - the adjustment is clipped to ``FORECAST_BIAS_MAX_ADJUSTMENT_F``;
-    - dynamic sigma only widens the baseline sigma, never narrows it from a noisy sample.
+    - dynamic sigma widens at ``DYNAMIC_SIGMA_MIN_SAMPLES``, but narrowing below the baseline
+      needs the larger ``DYNAMIC_SIGMA_NARROW_MIN_SAMPLES`` of verified non-lookahead errors
+      and is floored at ``DYNAMIC_SIGMA_MIN_F``.
     """
     series_ticker = _series_prefix(ticker)
     hour_key = target_hour if variable == WeatherVariable.POINT_TEMP_F else None
@@ -89,7 +91,18 @@ def apply_forecast_adjustments(
         if sigma_samples >= settings.dynamic_sigma_min_samples and rmse is not None:
             sigma_rmse = float(rmse)
             calibrated = sigma_rmse * settings.dynamic_sigma_multiplier
-            sigma = min(settings.dynamic_sigma_max_f, max(base_sigma, calibrated))
+            if calibrated >= base_sigma:
+                sigma = min(settings.dynamic_sigma_max_f, calibrated)
+            elif (
+                settings.dynamic_sigma_allow_narrowing
+                and not settings.dynamic_sigma_include_lookahead
+                and sigma_samples >= settings.dynamic_sigma_narrow_min_samples
+            ):
+                # Narrowing is how verified evidence can ever reopen the uncertainty gate, so it
+                # demands a larger clean (non-lookahead) sample and keeps a hard floor.
+                sigma = max(settings.dynamic_sigma_min_f, calibrated)
+            else:
+                sigma_rmse = None  # not enough clean evidence to narrow; keep the baseline
 
     return ForecastAdjustment(
         raw_mean=raw_mean,

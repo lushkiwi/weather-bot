@@ -53,6 +53,43 @@ class OpenMeteoClient:
             return None
         return {k: (v[0] if isinstance(v, list) and v else v) for k, v in daily.items()}
 
+    def ensemble_hourly_temperatures(
+        self, latitude: float, longitude: float, target_date: date, models: str
+    ) -> dict[str, dict[int, float]]:
+        """Per-member hourly temperatures for one local day: member key -> {hour: temp_f}.
+
+        Backed by the (free, keyless) Open-Meteo ensemble API. The spread across members is a
+        day-specific forecast-uncertainty estimate, replacing the hardcoded climatological sigma
+        when enough members report (see ForecastEngine.sigma_base).
+        """
+        params = {
+            "latitude": latitude,
+            "longitude": longitude,
+            "temperature_unit": "fahrenheit",
+            "timezone": "auto",
+            "start_date": target_date.isoformat(),
+            "end_date": target_date.isoformat(),
+            "hourly": "temperature_2m",
+            "models": models,
+        }
+        resp = self.session.get("https://ensemble-api.open-meteo.com/v1/ensemble", params=params, timeout=20)
+        resp.raise_for_status()
+        hourly = resp.json().get("hourly") or {}
+        times = hourly.get("time") or []
+        members: dict[str, dict[int, float]] = {}
+        for key, series in hourly.items():
+            if key == "time" or not key.startswith("temperature_2m") or not isinstance(series, list):
+                continue
+            for timestamp, value in zip(times, series):
+                if value is None:
+                    continue
+                try:
+                    hour = int(str(timestamp)[11:13])
+                    members.setdefault(key, {})[hour] = float(value)
+                except (TypeError, ValueError):
+                    continue
+        return members
+
     def hourly_temperature(self, latitude: float, longitude: float, target_date: date, target_hour: int) -> float | None:
         params = {
             "latitude": latitude,

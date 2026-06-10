@@ -7,16 +7,22 @@ from typing import Any
 from .config import Settings
 from .fees import FeeModel
 from .forecast_adjustments import apply_forecast_adjustments
+from .forecast_sources import ForecastEngine
 from .kalshi_client import KalshiClient
 from .market_parser import parse_market
-from .models import WeatherVariable
+from .models import TEMP_VARIABLES, WeatherVariable
 from .orderbook import parse_market_quote, parse_orderbook
-from .paper import TEMP_VARIABLES, TradeCandidate, _event_ticker, _is_lookahead
-from .probability import base_sigma, estimate_probability, forecast_resolves_strikes, strike_spacing
+from .paper import TradeCandidate, _event_ticker, _is_lookahead, _log_series_coverage
+from .probability import (
+    blend_probabilities,
+    estimate_probability,
+    forecast_resolves_strikes,
+    market_implied_probability,
+    strike_spacing,
+)
 from .safety import SafetyGuard
 from .stations import station_for_ticker
 from .storage import Store
-from .weather import OpenMeteoClient, value_for_variable
 
 PRODUCTION_BASE_URL = "https://external-api.kalshi.com/trade-api/v2"
 
@@ -78,14 +84,11 @@ class ProductionShadowTracker:
             prod_overrides["kalshi_private_key"] = settings.kalshi_shadow_private_key
         prod_settings = settings.model_copy(update=prod_overrides)
         self.kalshi = KalshiClient(prod_settings)
-        self.weather = OpenMeteoClient(settings)
+        self.forecasts = ForecastEngine(settings)
         self.store = store
         self.quantity = quantity
         self.fee_model = fee_model or FeeModel()
         self.safety_guard = safety_guard or SafetyGuard()
-        self._geo_cache: dict[str, tuple[float, float, str] | None] = {}
-        self._hourly_cache: dict[tuple[float, float, object, int], float | None] = {}
-        self._daily_cache: dict[tuple[float, float, object], dict | None] = {}
 
     def run_once(self, limit: int) -> ShadowRunResult:
         series_tickers = self.settings.series_ticker_list()
@@ -99,18 +102,25 @@ class ProductionShadowTracker:
             for market in self.kalshi.iter_markets(limit=limit, series_ticker=series_ticker)
         ) if series_tickers else self.kalshi.iter_markets(limit=limit)
 
-        # Pass 1: evaluate every market without touching portfolio state.
+        # Pass 1: evaluate every market without touching portfolio state. Per-series drop
+        # reasons are tallied so configured series that never produce a snapshot are visible.
         evaluations: list[_ShadowEvaluation] = []
+        coverage: dict[str, dict[str, int]] = {}
         for market in market_iter:
             totals["markets_seen"] += 1
+            series_cov = coverage.setdefault(str(market.get("ticker") or "").split("-", 1)[0], {})
             try:
                 evaluation = self._evaluate_market(market)
             except Exception as exc:  # noqa: BLE001
                 totals["market_errors"] += 1
+                series_cov["error"] = series_cov.get("error", 0) + 1
                 self.store.insert_runner_event("error", f"shadow_market_error ticker={market.get('ticker')} {type(exc).__name__}: {exc}")
                 continue
-            if evaluation is not None:
-                evaluations.append(evaluation)
+            if isinstance(evaluation, str):
+                series_cov[evaluation] = series_cov.get(evaluation, 0) + 1
+                continue
+            series_cov["evaluated"] = series_cov.get("evaluated", 0) + 1
+            evaluations.append(evaluation)
 
         # Best-strike-per-event: only the single highest-EV tradeable strike in each correlated
         # ladder may become a shadow fill; the rest are recorded as snapshots but skipped.
@@ -119,6 +129,8 @@ class ProductionShadowTracker:
         # Pass 2: persist snapshots in evaluation order, applying stateful safety to survivors.
         for evaluation in evaluations:
             self._persist_evaluation(scan_id, evaluation, totals)
+
+        _log_series_coverage(self.store, "shadow", scan_id, series_tickers, coverage)
 
         return ShadowRunResult(
             scan_id,
@@ -130,22 +142,26 @@ class ProductionShadowTracker:
             totals["market_errors"],
         )
 
-    def _evaluate_market(self, market: dict) -> _ShadowEvaluation | None:
-        """Build a market's shadow snapshot payload + best candidate without portfolio state."""
+    def _evaluate_market(self, market: dict) -> _ShadowEvaluation | str:
+        """Build a market's shadow snapshot payload + best candidate without portfolio state.
+
+        Returns a drop-reason string (tallied per series for coverage logging) when the market
+        cannot be evaluated at all.
+        """
         if not _market_is_tradeable(market):
-            return None
+            return "not_tradeable"
         parsed = parse_market(market)
         if not parsed or not self._usable(parsed):
-            return None
+            return "unparseable_or_unusable"
 
         # Prefer the exact settlement-station coordinates over a city-name geocode.
-        geo = station_for_ticker(parsed.ticker) or self._geocode(parsed.city or "")
+        geo = station_for_ticker(parsed.ticker) or self.forecasts.geocode(parsed.city or "")
         if not geo:
-            return None
+            return "no_location"
 
-        forecast_value = self._forecast_value(geo[0], geo[1], parsed)
+        forecast_value, forecast_note = self.forecasts.value(geo[0], geo[1], parsed)
         if forecast_value is None:
-            return None
+            return "no_forecast"
 
         orderbook_payload = self.kalshi.get_orderbook(parsed.ticker)
         quote = parse_orderbook(orderbook_payload)
@@ -156,6 +172,7 @@ class ProductionShadowTracker:
         yes_ask_size = depth["yes_ask_size"] or _float_or_zero(market.get("yes_ask_size_fp"))
         no_ask_size = depth["no_ask_size"] or _first_float(market.get("no_ask_size_fp"), market.get("yes_bid_size_fp"))
 
+        sigma_base_value, sigma_note = self.forecasts.sigma_base(geo[0], geo[1], parsed)
         adjustment = apply_forecast_adjustments(
             store=self.store,
             settings=self.settings,
@@ -164,9 +181,9 @@ class ProductionShadowTracker:
             target_date=parsed.target_date,  # type: ignore[arg-type]
             target_hour=parsed.target_hour,
             raw_mean=forecast_value,
-            base_sigma=base_sigma(parsed.variable, parsed.target_date),  # type: ignore[arg-type]
+            base_sigma=sigma_base_value,
         )
-        source_bits = []
+        source_bits = [bit for bit in (forecast_note, sigma_note) if bit]
         if adjustment.used_bias_correction:
             source_bits.append(f"bias_corrected_n{adjustment.bias_samples}")
         if adjustment.used_dynamic_sigma:
@@ -179,15 +196,34 @@ class ProductionShadowTracker:
             comparator=parsed.comparator,
             band_lower=parsed.band_lower,
             band_upper=parsed.band_upper,
-            direct_probability=self._rain_probability(geo[0], geo[1], parsed),
+            direct_probability=self.forecasts.rain_probability(geo[0], geo[1], parsed),
             sigma_override=adjustment.sigma,
             source_suffix="+".join(source_bits) if source_bits else None,
         )
-        fair_yes = estimate.probability_yes * 100.0
-        fair_no = (1.0 - estimate.probability_yes) * 100.0
+
+        # Market-implied prior: blend the model toward the production book's price (see
+        # paper.py for rationale); the raw model value stays in the source suffix.
+        probability_yes = estimate.probability_yes
+        model_source = estimate.source
+        if self.settings.enable_market_prob_blend:
+            p_market = market_implied_probability(
+                quote.yes_bid, quote.yes_ask, self.settings.market_prob_blend_max_spread_cents
+            )
+            if p_market is not None:
+                blended = blend_probabilities(
+                    probability_yes, p_market, self.settings.market_prob_blend_model_weight
+                )
+                model_source += (
+                    f"+mktblend_w{self.settings.market_prob_blend_model_weight:g}"
+                    f"_raw{probability_yes:.3f}_mkt{p_market:.3f}"
+                )
+                probability_yes = blended
+
+        fair_yes = probability_yes * 100.0
+        fair_no = (1.0 - probability_yes) * 100.0
         candidates = [
-            self._candidate("BUY_YES", quote.yes_ask, yes_ask_size, estimate.probability_yes),
-            self._candidate("BUY_NO", quote.no_ask, no_ask_size, 1.0 - estimate.probability_yes),
+            self._candidate("BUY_YES", quote.yes_ask, yes_ask_size, probability_yes),
+            self._candidate("BUY_NO", quote.no_ask, no_ask_size, 1.0 - probability_yes),
         ]
         liquid = [c for c in candidates if c.ask_size >= self.quantity and c.ask_cents is not None and c.ask_cents > 0]
         selected = max(liquid, key=lambda c: c.ev_cents if c.ev_cents is not None else -10_000.0) if liquid else max(candidates, key=lambda c: c.ev_cents if c.ev_cents is not None else -10_000.0)
@@ -220,11 +256,11 @@ class ProductionShadowTracker:
             "raw_forecast_value": adjustment.raw_mean,
             "forecast_value": estimate.mean,
             "forecast_sigma": estimate.sigma,
-            "model_source": estimate.source,
+            "model_source": model_source,
             "bias_correction": adjustment.bias_correction,
             "bias_correction_n": adjustment.bias_samples,
             "bias_mae": adjustment.bias_mae,
-            "probability_yes": estimate.probability_yes,
+            "probability_yes": probability_yes,
             "fair_yes_cents": fair_yes,
             "fair_no_cents": fair_no,
             "yes_bid_cents": quote.yes_bid,
@@ -333,34 +369,6 @@ class ProductionShadowTracker:
         fee = self.fee_model.buy_fee_cents(ask_cents, self.quantity) if ask_cents is not None else None
         ev = self.fee_model.buy_ev_cents(probability_win, ask_cents, self.quantity) if ask_cents is not None else None
         return TradeCandidate(side, ask_cents, ask_size, probability_win, fair, fee, ev)
-
-    def _forecast_value(self, lat: float, lon: float, parsed) -> float | None:
-        if parsed.variable == WeatherVariable.POINT_TEMP_F and parsed.target_hour is not None:
-            key = (lat, lon, parsed.target_date, parsed.target_hour)
-            if key not in self._hourly_cache:
-                self._hourly_cache[key] = self.weather.hourly_temperature(lat, lon, parsed.target_date, parsed.target_hour)
-            return self._hourly_cache[key]
-        key = (lat, lon, parsed.target_date)
-        if key not in self._daily_cache:
-            self._daily_cache[key] = self.weather.daily_forecast(lat, lon, parsed.target_date)
-        return value_for_variable(self._daily_cache[key] or {}, parsed.variable)
-
-    def _geocode(self, city: str) -> tuple[float, float, str] | None:
-        if city not in self._geo_cache:
-            self._geo_cache[city] = self.weather.geocode(city)
-        return self._geo_cache[city]
-
-    def _rain_probability(self, lat: float, lon: float, parsed) -> float | None:
-        """Forecast precipitation probability for an "any rain" market, else None."""
-        if parsed.variable != WeatherVariable.RAIN_IN or parsed.threshold is None or parsed.threshold > 0.25:
-            return None
-        daily = self._daily_cache.get((lat, lon, parsed.target_date))
-        if not daily:
-            return None
-        try:
-            return float(daily.get("precipitation_probability_max")) / 100.0
-        except (TypeError, ValueError):
-            return None
 
     def _usable(self, parsed) -> bool:
         # A known settlement station is as good a location as a parsed city name: many series
